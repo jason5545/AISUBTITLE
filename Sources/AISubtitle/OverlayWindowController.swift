@@ -89,7 +89,7 @@ final class OverlayWindowController {
         usageLabel.setContentHuggingPriority(.required, for: .horizontal)
         usageLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        textLabel.font = NSFont.systemFont(ofSize: 22, weight: .semibold)
+        textLabel.font = NSFont.systemFont(ofSize: 15.4, weight: .semibold)
         textLabel.textColor = .white
         textLabel.maximumNumberOfLines = 2
         textLabel.lineBreakMode = .byWordWrapping
