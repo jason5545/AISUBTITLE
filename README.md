@@ -10,6 +10,8 @@ macOS floating subtitle pipeline:
 
 When Helium allows Apple Events JavaScript, AISubtitle scans Helium tabs for the one that is actually playing audio/video. The sounded tab URL becomes the translation session key, and recent same-URL subtitle turns are sent to Gemini as context. If that Helium setting is disabled, AISubtitle falls back to the active tab URL.
 
+The translator also uses a small rolling subtitle context. By default it may hold one source line for up to `1.2s`, then translates that target line with the previous two source lines and the next source line as semantic context. Output still stays one JSON subtitle event per source id, so the overlay timing contract does not change. Set `AISUBTITLE_TRANSLATE_LOOKAHEAD_LINES=0` to return to immediate line-by-line translation.
+
 ## Real Run
 
 Helium must be running. The first capture run will need macOS Screen Recording permission for the terminal or packaged app that launches this.

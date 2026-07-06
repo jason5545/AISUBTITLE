@@ -65,6 +65,21 @@ DRAIN_SECONDS = float(
 CLINE_WEEKLY_LIMIT_HOURS = float(os.environ.get("CLINE_USAGE_WEEKLY_LIMIT_HOURS", "5"))
 CLINE_MONTHLY_LIMIT_HOURS = float(os.environ.get("CLINE_USAGE_MONTHLY_LIMIT_HOURS", str(CLINE_WEEKLY_LIMIT_HOURS * 4)))
 SESSION_HISTORY_LIMIT = int(os.environ.get("AISUBTITLE_TRANSLATE_SESSION_HISTORY_LIMIT", "6"))
+LOOKAHEAD_LINES = min(1, max(0, int(os.environ.get("AISUBTITLE_TRANSLATE_LOOKAHEAD_LINES", "1"))))
+LOOKAHEAD_MAX_DELAY_SECONDS = max(
+    0.0,
+    float(os.environ.get("AISUBTITLE_TRANSLATE_LOOKAHEAD_MAX_DELAY_SECONDS", "1.2")),
+)
+PREVIOUS_SOURCE_CONTEXT_LINES = max(
+    0,
+    int(os.environ.get("AISUBTITLE_TRANSLATE_PREVIOUS_SOURCE_CONTEXT_LINES", "2")),
+)
+ORDERED_EMISSION = (
+    os.environ.get("AISUBTITLE_TRANSLATE_ORDERED_EMISSION", "1" if LOOKAHEAD_LINES > 0 else "0")
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
 OPENCC_CONFIG = os.environ.get("AISUBTITLE_OPENCC_CONFIG", "s2twp.json").strip() or "s2twp.json"
 OPENCC_BIN = os.environ.get("AISUBTITLE_OPENCC_BIN", "").strip()
 VERBOSE_LOG = os.environ.get("AISUBTITLE_VERBOSE_LOG", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -103,6 +118,8 @@ _CONNECTION_ERRORS = (
     OSError,
 )
 
+READ_TIMEOUT = object()
+
 SUPPLEMENTARY_OPENCC_MAPPINGS = (
     ("優盤", "隨身碟"),
     ("拍制", "拍製"),
@@ -130,14 +147,32 @@ class TranslationResult:
     context_url: object
 
 
+@dataclass(frozen=True)
+class TranslationJob:
+    text: str
+    source_id: int | None
+    context: dict[str, object]
+    session_key: str | None
+
+
 class LineReader:
     def __init__(self, fd: int):
         self.fd = fd
         self.buffer = b""
         self.eof = False
 
-    def read_line(self) -> str | None:
+    def read_line(self, timeout: float | None = None) -> str | None | object:
+        deadline = time.monotonic() + max(0.0, timeout) if timeout is not None else None
+
         while b"\n" not in self.buffer and not self.eof:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return READ_TIMEOUT
+                readable, _, _ = select.select([self.fd], [], [], remaining)
+                if not readable:
+                    return READ_TIMEOUT
+
             chunk = os.read(self.fd, 4096)
             if not chunk:
                 self.eof = True
@@ -550,8 +585,65 @@ def direct_process(text: str) -> tuple[str, dict[str, object]]:
     return converted, direct_usage_metadata(elapsed)
 
 
+def source_context_item(job: TranslationJob) -> dict[str, object]:
+    item: dict[str, object] = {"text": job.text}
+    if isinstance(job.source_id, int):
+        item["id"] = job.source_id
+
+    language = job.context.get("language")
+    if isinstance(language, str) and language:
+        item["language"] = language
+
+    return item
+
+
+def format_source_context_item(item: object) -> str | None:
+    if not isinstance(item, dict):
+        return None
+
+    text = str(item.get("text", "")).strip()
+    if not text:
+        return None
+
+    labels: list[str] = []
+    source_id = item.get("id")
+    if isinstance(source_id, int):
+        labels.append(f"#{source_id}")
+    language = item.get("language")
+    if isinstance(language, str) and language.strip():
+        labels.append(language.strip())
+
+    prefix = f"[{', '.join(labels)}] " if labels else ""
+    return prefix + text
+
+
 def context_lines(context: dict[str, object]) -> list[str]:
     lines: list[str] = []
+
+    previous = context.get("previous_subtitles")
+    target = context.get("target_subtitle")
+    next_subtitle = context.get("next_subtitle")
+    has_nearby_context = (
+        (isinstance(previous, list) and bool(previous))
+        or isinstance(target, dict)
+        or isinstance(next_subtitle, dict)
+    )
+    if has_nearby_context:
+        lines.append("Nearby source subtitles for semantic context:")
+        if isinstance(previous, list):
+            previous_items = previous[-PREVIOUS_SOURCE_CONTEXT_LINES:] if PREVIOUS_SOURCE_CONTEXT_LINES > 0 else []
+            for item in previous_items:
+                formatted = format_source_context_item(item)
+                if formatted:
+                    lines.append(f"- Previous: {formatted}")
+
+        formatted_target = format_source_context_item(target)
+        if formatted_target:
+            lines.append(f"- TARGET: {formatted_target}")
+
+        formatted_next = format_source_context_item(next_subtitle)
+        if formatted_next:
+            lines.append(f"- Next: {formatted_next}")
 
     url = context.get("context_url")
     if isinstance(url, str) and url:
@@ -582,11 +674,32 @@ def request_payload(text: str, context: dict[str, object]) -> dict[str, object]:
     user_parts = ["/no_think"]
     context_part = "\n".join(context_lines(context))
     if context_part:
+        if isinstance(context.get("target_subtitle"), dict):
+            user_parts.append(
+                "Use this context to translate the TARGET subtitle naturally. "
+                "Previous and Next lines are context only: do not translate them into the output, "
+                "but use them to choose natural Taiwan Mandarin word order, references, and tone. "
+                "Keep the output suitable for the TARGET subtitle timing. Handle ASR subtitle splits "
+                "carefully: if TARGET ends with an incomplete number, currency amount, percentage, "
+                "proper noun, or fixed phrase that clearly continues in Next, do not finalize a wrong "
+                "partial translation; output a natural lead-in for TARGET. If TARGET clearly continues "
+                "a number, currency amount, percentage, proper noun, or fixed phrase from Previous, "
+                "translate the completed local fragment for TARGET so the subtitle reads continuously.\n"
+                + context_part
+            )
+        else:
+            user_parts.append(
+                "Use this page/session context only to resolve names, pronouns, and terminology. "
+                "Do not mention the context in the output.\n" + context_part
+            )
+
+    if isinstance(context.get("target_subtitle"), dict):
         user_parts.append(
-            "Use this page/session context only to resolve names, pronouns, and terminology. "
-            "Do not mention the context in the output.\n" + context_part
+            "Translate ONLY the TARGET subtitle to zh-TW Traditional Chinese. "
+            "The output must be one subtitle line, with no quotes, labels, or notes:\n" + text
         )
-    user_parts.append("Translate this subtitle to zh-TW:\n" + text)
+    else:
+        user_parts.append("Translate this subtitle to zh-TW:\n" + text)
 
     payload: dict[str, object] = {
         "model": MODEL,
@@ -595,9 +708,12 @@ def request_payload(text: str, context: dict[str, object]) -> dict[str, object]:
                 "role": "system",
                 "content": (
                     "You are a live subtitle translator. Output ONLY zh-TW Traditional Chinese. "
-                    "Use Taiwan Mandarin wording and Traditional Chinese characters. NEVER output "
-                    "Simplified Chinese characters. Do not include reasoning, notes, quotes, prefixes, "
-                    "or alternatives."
+                    "Use natural Taiwan Mandarin wording and Traditional Chinese characters. Translate "
+                    "for subtitles instead of doing literal sentence-by-sentence conversion. You may adjust "
+                    "word order using nearby context, and you may repair obvious subtitle-boundary fragments "
+                    "such as split numbers or currency amounts, but output only the requested subtitle line. "
+                    "NEVER output Simplified Chinese characters. Do not include reasoning, notes, quotes, "
+                    "prefixes, or alternatives."
                 ),
             },
             {
@@ -803,42 +919,213 @@ def main() -> int:
     key_name = api_key_name()
 
     last_emitted_id: int | None = None
+    next_expected_emit_id: int | None = None
+    expected_emit_ids: set[int] = set()
+    pending_emit_results: dict[int, TranslationResult] = {}
+    recent_sources_by_session: dict[str, list[dict[str, object]]] = {}
     emit_lock = threading.Lock()
     in_flight = threading.BoundedSemaphore(MAX_IN_FLIGHT_TRANSLATIONS)
 
-    def emit_result(result: TranslationResult | None) -> None:
+    def emit_now(result: TranslationResult) -> None:
         nonlocal last_emitted_id
+
+        source_id = result.source_id
+        if isinstance(source_id, int):
+            last_emitted_id = source_id
+
+        record_session_turn(result.session_key, result.source_text, result.translated_text)
+        verbose(f"emit id={source_id} text={preview(result.translated_text)!r}")
+        print(json.dumps(result_payload(result), ensure_ascii=False), flush=True)
+
+    def next_expected_id() -> int | None:
+        return min(expected_emit_ids) if expected_emit_ids else None
+
+    def flush_ordered_results_locked() -> None:
+        nonlocal next_expected_emit_id
+
+        while next_expected_emit_id is not None:
+            source_id = next_expected_emit_id
+            result = pending_emit_results.pop(source_id, None)
+            if result is None:
+                if source_id in expected_emit_ids:
+                    return
+                next_expected_emit_id = next_expected_id()
+                continue
+
+            expected_emit_ids.discard(source_id)
+            if last_emitted_id is not None and source_id <= last_emitted_id:
+                log(f"{PROVIDER} skipped duplicate ordered id={source_id} last_emitted_id={last_emitted_id}")
+            else:
+                emit_now(result)
+            next_expected_emit_id = next_expected_id()
+
+    def register_expected_emit_id(source_id: int | None) -> None:
+        nonlocal next_expected_emit_id
+
+        if not ORDERED_EMISSION or not isinstance(source_id, int):
+            return
+
+        with emit_lock:
+            if last_emitted_id is not None and source_id <= last_emitted_id:
+                return
+            expected_emit_ids.add(source_id)
+            if next_expected_emit_id is None or source_id < next_expected_emit_id:
+                next_expected_emit_id = source_id
+
+    def mark_result_failed(source_id: int | None) -> None:
+        if not ORDERED_EMISSION or not isinstance(source_id, int):
+            return
+
+        with emit_lock:
+            expected_emit_ids.discard(source_id)
+            pending_emit_results.pop(source_id, None)
+            flush_ordered_results_locked()
+
+    def emit_result(result: TranslationResult | None) -> None:
+        nonlocal next_expected_emit_id
 
         if result is None:
             return
 
+        source_id = result.source_id
+        if ORDERED_EMISSION and isinstance(source_id, int):
+            with emit_lock:
+                if last_emitted_id is not None and source_id <= last_emitted_id:
+                    log(f"{PROVIDER} skipped out-of-order id={source_id} last_emitted_id={last_emitted_id}")
+                    return
+                expected_emit_ids.add(source_id)
+                if next_expected_emit_id is None or source_id < next_expected_emit_id:
+                    next_expected_emit_id = source_id
+                pending_emit_results[source_id] = result
+                flush_ordered_results_locked()
+            return
+
         with emit_lock:
-            source_id = result.source_id
             if isinstance(source_id, int):
                 if last_emitted_id is not None and source_id <= last_emitted_id:
                     log(f"{PROVIDER} skipped out-of-order id={source_id} last_emitted_id={last_emitted_id}")
                     return
-                last_emitted_id = source_id
+            emit_now(result)
 
-            record_session_turn(result.session_key, result.source_text, result.translated_text)
-            verbose(f"emit id={source_id} text={preview(result.translated_text)!r}")
-            print(json.dumps(result_payload(result), ensure_ascii=False), flush=True)
-
-    def finish_future(future: concurrent.futures.Future[TranslationResult | None]) -> None:
+    def finish_future(source_id: int | None, future: concurrent.futures.Future[TranslationResult | None]) -> None:
         try:
-            emit_result(future.result())
+            result = future.result()
+            if result is None:
+                mark_result_failed(source_id)
+            else:
+                emit_result(result)
         except Exception as error:
+            mark_result_failed(source_id)
             log(f"{PROVIDER} translation worker failed: {error!r}")
             print(f"{PROVIDER} translation failed; logged to {LOG_FILE}", file=sys.stderr, flush=True)
         finally:
             in_flight.release()
 
+    def source_history_key(session_key: str | None) -> str:
+        return session_key or "__default__"
+
+    def previous_source_context(job: TranslationJob) -> list[dict[str, object]]:
+        if PREVIOUS_SOURCE_CONTEXT_LINES <= 0:
+            return []
+
+        history = recent_sources_by_session.get(source_history_key(job.session_key), [])
+        return [dict(item) for item in history[-PREVIOUS_SOURCE_CONTEXT_LINES:]]
+
+    def record_source_context(job: TranslationJob) -> None:
+        if PREVIOUS_SOURCE_CONTEXT_LINES <= 0:
+            return
+
+        key = source_history_key(job.session_key)
+        history = recent_sources_by_session.setdefault(key, [])
+        history.append(source_context_item(job))
+        history_limit = max(PREVIOUS_SOURCE_CONTEXT_LINES, SESSION_HISTORY_LIMIT, 4)
+        if len(history) > history_limit:
+            del history[: len(history) - history_limit]
+
+    def same_source_session(left: TranslationJob, right: TranslationJob) -> bool:
+        return source_history_key(left.session_key) == source_history_key(right.session_key)
+
+    def can_use_next_context(left: TranslationJob, right: TranslationJob) -> bool:
+        if not same_source_session(left, right):
+            return False
+
+        if isinstance(left.source_id, int) and isinstance(right.source_id, int):
+            return right.source_id == left.source_id + 1
+
+        return True
+
+    def translation_context(job: TranslationJob, next_job: TranslationJob | None = None) -> dict[str, object]:
+        context = dict(job.context)
+        context["target_subtitle"] = source_context_item(job)
+
+        previous = previous_source_context(job)
+        if previous:
+            context["previous_subtitles"] = previous
+
+        if next_job is not None and can_use_next_context(job, next_job):
+            context["next_subtitle"] = source_context_item(next_job)
+
+        return context
+
+    def submit_translation_job(
+        executor: concurrent.futures.ThreadPoolExecutor,
+        job: TranslationJob,
+        next_job: TranslationJob | None = None,
+    ) -> bool:
+        global missing_api_key_logged
+
+        api_key = os.environ.get(key_name, "").strip()
+        if not api_key:
+            if not missing_api_key_logged:
+                log(f"{PROVIDER} translation failed: {key_name} missing. secret={SECRET_FILE}")
+                missing_api_key_logged = True
+            return False
+
+        context = translation_context(job, next_job)
+        wait_started = time.perf_counter()
+        in_flight.acquire()
+        queue_wait = time.perf_counter() - wait_started
+        context["_queue_wait_seconds"] = queue_wait
+        if queue_wait >= 0.05:
+            log(f"{PROVIDER} waited for translation slot id={job.source_id} queue_wait={queue_wait:.3f}s")
+        else:
+            verbose(f"slot-ready id={job.source_id} queue_wait={queue_wait:.3f}s")
+
+        register_expected_emit_id(job.source_id)
+        try:
+            future = executor.submit(run_translation_job, job.text, job.source_id, api_key, context)
+        except Exception:
+            in_flight.release()
+            mark_result_failed(job.source_id)
+            raise
+        future.add_done_callback(lambda future, source_id=job.source_id: finish_future(source_id, future))
+        record_source_context(job)
+        return True
+
+    def pending_read_timeout(pending: TranslationJob | None) -> float | None:
+        if LOOKAHEAD_LINES <= 0 or pending is None:
+            return None
+
+        received_at = numeric(pending.context.get("_received_at")) or time.time()
+        elapsed = max(0.0, time.time() - received_at)
+        return max(0.0, LOOKAHEAD_MAX_DELAY_SECONDS - elapsed)
+
     reader = LineReader(sys.stdin.fileno())
+    pending_translation: TranslationJob | None = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_IN_FLIGHT_TRANSLATIONS) as executor:
         while True:
-            line = reader.read_line()
-            if line is None:
+            raw_line = reader.read_line(timeout=pending_read_timeout(pending_translation))
+            if raw_line is READ_TIMEOUT:
+                if pending_translation is not None:
+                    verbose(f"lookahead-timeout id={pending_translation.source_id}")
+                    submit_translation_job(executor, pending_translation)
+                    pending_translation = None
+                continue
+
+            if raw_line is None:
                 break
+
+            line = str(raw_line)
             if not line:
                 continue
             line, dropped = reader.drain_to_latest(line, DRAIN_SECONDS)
@@ -866,8 +1153,14 @@ def main() -> int:
             session_key = canonical_session_key(parsed.get("context_url"))
             parsed["session_key"] = session_key or ""
             parsed["session_history"] = session_history(session_key)
+            job = TranslationJob(text=text, source_id=source_id, context=dict(parsed), session_key=session_key)
 
             if parsed.get("direct") is True:
+                if pending_translation is not None:
+                    submit_translation_job(executor, pending_translation, next_job=job)
+                    pending_translation = None
+
+                register_expected_emit_id(source_id)
                 direct_started = time.perf_counter()
                 verbose(f"direct-start id={source_id}")
                 translated, metadata = direct_process(text)
@@ -882,29 +1175,25 @@ def main() -> int:
                         context_url=parsed.get("context_url"),
                     )
                 )
+                record_source_context(job)
                 continue
 
-            api_key = os.environ.get(key_name, "").strip()
-            if not api_key:
-                if not missing_api_key_logged:
-                    log(f"{PROVIDER} translation failed: {key_name} missing. secret={SECRET_FILE}")
-                    missing_api_key_logged = True
+            if LOOKAHEAD_LINES > 0:
+                if pending_translation is not None:
+                    submit_translation_job(executor, pending_translation, next_job=job)
+                pending_translation = job
+                verbose(
+                    f"lookahead-pending id={source_id} "
+                    f"delay={LOOKAHEAD_MAX_DELAY_SECONDS:.3f}s "
+                    f"text={preview(text)!r}"
+                )
                 continue
 
-            wait_started = time.perf_counter()
-            in_flight.acquire()
-            queue_wait = time.perf_counter() - wait_started
-            parsed["_queue_wait_seconds"] = queue_wait
-            if queue_wait >= 0.05:
-                log(f"{PROVIDER} waited for translation slot id={source_id} queue_wait={queue_wait:.3f}s")
-            else:
-                verbose(f"slot-ready id={source_id} queue_wait={queue_wait:.3f}s")
-            try:
-                future = executor.submit(run_translation_job, text, source_id, api_key, dict(parsed))
-            except Exception:
-                in_flight.release()
-                raise
-            future.add_done_callback(finish_future)
+            submit_translation_job(executor, job)
+
+        if pending_translation is not None:
+            verbose(f"lookahead-flush-eof id={pending_translation.source_id}")
+            submit_translation_job(executor, pending_translation)
 
     return 0
 
