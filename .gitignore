@@ -1,0 +1,7 @@
+.build/
+dist/
+.DS_Store
+config.json
+*.log
+.secret
+.aisubtitle-usage.json

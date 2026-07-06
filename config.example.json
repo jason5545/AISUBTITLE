@@ -1,0 +1,33 @@
+{
+  "targetApplicationNames": ["Helium"],
+  "targetBundleIdentifiers": ["net.imput.helium", "app.helium", "com.imput.helium"],
+  "audioSampleRate": 16000,
+  "audioChannelCount": 1,
+  "showChineseSource": false,
+  "translatePartialResults": false,
+  "asrCommand": {
+    "argv": [
+      ".build/debug/qwen3-asr-stdin",
+      "--model-dir",
+      "/Users/jianruicheng/Library/Application Support/com.jasonchien.Voco/Qwen3Models/mlx-community_Qwen3-ASR-1.7B-8bit",
+      "--language",
+      "auto",
+      "--min-segment-seconds",
+      "1.1",
+      "--max-segment-seconds",
+      "3.2",
+      "--silence-seconds",
+      "0.28"
+    ]
+  },
+  "translatorCommand": {
+    "argv": [
+      "/Users/jianruicheng/GitHub/AISUBTITLE/scripts/codex-translate-lines.sh"
+    ],
+    "environment": {
+      "AISUBTITLE_TRANSLATE_PROVIDER": "openrouter",
+      "OPENROUTER_TRANSLATE_MODEL": "google/gemini-3.1-flash-lite",
+      "OPENROUTER_REASONING_EFFORT": "none"
+    }
+  }
+}
