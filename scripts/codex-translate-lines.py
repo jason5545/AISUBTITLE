@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import select
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -58,9 +60,31 @@ DRAIN_SECONDS = float(os.environ.get("CODEX_TRANSLATE_DRAIN_SECONDS", "0.02"))
 CLINE_WEEKLY_LIMIT_HOURS = float(os.environ.get("CLINE_USAGE_WEEKLY_LIMIT_HOURS", "5"))
 CLINE_MONTHLY_LIMIT_HOURS = float(os.environ.get("CLINE_USAGE_MONTHLY_LIMIT_HOURS", str(CLINE_WEEKLY_LIMIT_HOURS * 4)))
 SESSION_HISTORY_LIMIT = int(os.environ.get("AISUBTITLE_TRANSLATE_SESSION_HISTORY_LIMIT", "6"))
+OPENCC_CONFIG = os.environ.get("AISUBTITLE_OPENCC_CONFIG", "s2twp.json").strip() or "s2twp.json"
+OPENCC_BIN = os.environ.get("AISUBTITLE_OPENCC_BIN", "").strip()
 
 openrouter_session_cost = 0.0
 translation_sessions: dict[str, list[dict[str, str]]] = {}
+opencc_converter: object | None = None
+opencc_import_failed = False
+opencc_cli_path: str | None = None
+missing_api_key_logged = False
+
+SUPPLEMENTARY_OPENCC_MAPPINGS = (
+    ("優盤", "隨身碟"),
+    ("拍制", "拍製"),
+    ("賬", "帳"),
+)
+
+JAPANESE_NAME_OPENCC_REVERTS = (
+    ("裡沙", "里沙"),
+    ("裡奈", "里奈"),
+    ("裡美", "里美"),
+    ("裡香", "里香"),
+    ("裡穗", "里穗"),
+    ("裡菜", "里菜"),
+    ("裡帆", "里帆"),
+)
 
 
 class LineReader:
@@ -165,6 +189,14 @@ def parse_line(line: str) -> dict[str, object]:
     parsed: dict[str, object] = {"text": str(text)}
     if isinstance(source_id, int):
         parsed["id"] = source_id
+
+    direct = payload.get("direct")
+    if isinstance(direct, bool):
+        parsed["direct"] = direct
+
+    language = payload.get("language")
+    if isinstance(language, str) and language.strip():
+        parsed["language"] = language.strip()
 
     for key in ("context_url", "context_title", "context_source"):
         value = payload.get(key)
@@ -337,6 +369,115 @@ def usage_metadata(response: dict[str, object], elapsed: float) -> dict[str, obj
     }
 
 
+def direct_usage_metadata(elapsed: float) -> dict[str, object]:
+    return {
+        "provider": "direct",
+        "model": "opencc",
+        "elapsed_seconds": round(elapsed, 3),
+        "display": "Direct",
+    }
+
+
+def apply_opencc_supplements(text: str) -> str:
+    result = text
+    for source, target in SUPPLEMENTARY_OPENCC_MAPPINGS:
+        result = result.replace(source, target)
+    for source, target in JAPANESE_NAME_OPENCC_REVERTS:
+        result = result.replace(source, target)
+    return result
+
+
+def convert_with_python_opencc(text: str) -> str | None:
+    global opencc_converter, opencc_import_failed
+
+    if opencc_import_failed:
+        return None
+
+    try:
+        if opencc_converter is None:
+            from opencc import OpenCC  # type: ignore
+
+            config_name = OPENCC_CONFIG.removesuffix(".json")
+            opencc_converter = OpenCC(config_name)
+        converted = opencc_converter.convert(text)  # type: ignore[attr-defined]
+        return str(converted)
+    except Exception as error:
+        opencc_import_failed = True
+        log(f"python opencc unavailable for direct mode: {error!r}")
+        return None
+
+
+def resolve_opencc_cli() -> str | None:
+    global opencc_cli_path
+
+    if opencc_cli_path is not None:
+        return opencc_cli_path or None
+
+    candidates = []
+    if OPENCC_BIN:
+        candidates.append(OPENCC_BIN)
+    candidates.extend(
+        [
+            shutil.which("opencc"),
+            "/opt/homebrew/bin/opencc",
+            "/usr/local/bin/opencc",
+        ]
+    )
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate) and os.access(candidate, os.X_OK):
+            opencc_cli_path = candidate
+            return candidate
+
+    opencc_cli_path = ""
+    return None
+
+
+def convert_with_opencc_cli(text: str) -> str | None:
+    executable = resolve_opencc_cli()
+    if not executable:
+        return None
+
+    try:
+        completed = subprocess.run(
+            [executable, "-c", OPENCC_CONFIG],
+            input=text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=2.0,
+            check=False,
+        )
+    except Exception as error:
+        log(f"opencc cli failed for direct mode: {error!r}")
+        return None
+
+    if completed.returncode != 0:
+        detail = completed.stderr.strip()[:500]
+        log(f"opencc cli failed status={completed.returncode}: {detail}")
+        return None
+
+    return completed.stdout.strip()
+
+
+def convert_chinese_direct(text: str) -> str:
+    converted = convert_with_python_opencc(text)
+    if converted is None:
+        converted = convert_with_opencc_cli(text)
+    if converted is None:
+        log("opencc unavailable for direct mode; returning source text")
+        converted = text
+    return apply_opencc_supplements(converted).strip()
+
+
+def direct_process(text: str) -> tuple[str, dict[str, object]]:
+    started_at = time.perf_counter()
+    converted = convert_chinese_direct(text)
+    elapsed = time.perf_counter() - started_at
+    log(f"direct subtitle ok opencc={OPENCC_CONFIG} elapsed={elapsed:.3f}s")
+    return converted, direct_usage_metadata(elapsed)
+
+
 def context_lines(context: dict[str, object]) -> list[str]:
     lines: list[str] = []
 
@@ -475,12 +616,10 @@ def translate(text: str, api_key: str, context: dict[str, object]) -> tuple[str,
 
 
 def main() -> int:
+    global missing_api_key_logged
+
     load_secret_file()
     key_name = api_key_name()
-    api_key = os.environ.get(key_name, "").strip()
-    if not api_key:
-        log(f"{PROVIDER} translation failed before launch: {key_name} missing. secret={SECRET_FILE}")
-        return 1
 
     reader = LineReader(sys.stdin.fileno())
     while True:
@@ -505,11 +644,21 @@ def main() -> int:
         parsed["session_key"] = session_key or ""
         parsed["session_history"] = session_history(session_key)
 
-        result = translate(text, api_key, parsed)
-        if result is None:
-            continue
+        if parsed.get("direct") is True:
+            translated, metadata = direct_process(text)
+        else:
+            api_key = os.environ.get(key_name, "").strip()
+            if not api_key:
+                if not missing_api_key_logged:
+                    log(f"{PROVIDER} translation failed: {key_name} missing. secret={SECRET_FILE}")
+                    missing_api_key_logged = True
+                continue
 
-        translated, metadata = result
+            result = translate(text, api_key, parsed)
+            if result is None:
+                continue
+
+            translated, metadata = result
         record_session_turn(session_key, text, translated)
 
         payload: dict[str, object] = {"text": translated}

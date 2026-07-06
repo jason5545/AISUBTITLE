@@ -5,7 +5,8 @@ macOS floating subtitle pipeline:
 1. Capture Helium audio with ScreenCaptureKit.
 2. Stream 16 kHz mono signed 16-bit PCM into local native Qwen3-ASR 1.7B.
 3. Send non-Chinese ASR segments to OpenRouter Gemini 3.1 Flash Lite for Traditional Chinese translation.
-4. Show translated text in an always-on-top floating window.
+4. Skip Chinese ASR segments by default; when macOS output volume is muted or zero, send them through direct OpenCC post-processing and bypass the LLM.
+5. Show translated or direct-processed text in an always-on-top floating window.
 
 When Helium allows Apple Events JavaScript, AISubtitle scans Helium tabs for the one that is actually playing audio/video. The sounded tab URL becomes the translation session key, and recent same-URL subtitle turns are sent to Gemini as context. If that Helium setting is disabled, AISubtitle falls back to the active tab URL.
 
@@ -66,6 +67,7 @@ Translator command contract:
 
 - stdin: JSONL transcript events.
 - stdout: JSONL translation events.
+- Chinese direct mode: set `"direct": true`; the translator bypasses the LLM, applies OpenCC `s2twp`, and reports usage as `Direct`.
 
 ```json
 {"text":"哈囉世界"}

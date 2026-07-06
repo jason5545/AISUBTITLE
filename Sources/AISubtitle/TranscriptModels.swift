@@ -49,7 +49,8 @@ struct TranscriptEvent {
         targetLanguage: String = "zh-Hant-TW",
         id: Int? = nil,
         issuedAt: TimeInterval? = nil,
-        browserContext: BrowserContext? = nil
+        browserContext: BrowserContext? = nil,
+        direct: Bool = false
     ) -> String {
         var object: [String: Any] = [
             "text": text,
@@ -64,6 +65,9 @@ struct TranscriptEvent {
         }
         if let issuedAt {
             object["issued_at"] = issuedAt
+        }
+        if direct {
+            object["direct"] = true
         }
         if let browserContext {
             object["context_url"] = browserContext.url

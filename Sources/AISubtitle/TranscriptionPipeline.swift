@@ -10,6 +10,7 @@ final class TranscriptionPipeline {
     private let config: AppConfig
     private let workingDirectory: URL
     private let browserContextProvider: (() -> BrowserContext?)?
+    private let systemOutputVolumeProvider = SystemOutputVolumeProvider()
     private let stateLock = NSLock()
     private var asrProcess: StreamingProcess?
     private var translatorProcess: StreamingProcess?
@@ -78,20 +79,32 @@ final class TranscriptionPipeline {
             return
         }
 
-        if !LanguageDecision.shouldTranslate(event) {
-            if config.showChineseSource {
-                onSubtitle?(event.text, event.language, nil)
-            } else {
-                onStatus?("Chinese source skipped")
-            }
+        let shouldTranslate = LanguageDecision.shouldTranslate(event)
+        let direct = !shouldTranslate && (config.showChineseSource || systemOutputVolumeProvider.isMutedOrSilent())
+
+        if !shouldTranslate && !direct {
+            onStatus?("Chinese source skipped")
             return
         }
 
         let issuedAt = Date().timeIntervalSince1970
         let id = allocateTranslationID(issuedAt: issuedAt)
         let browserContext = browserContextProvider?()
-        onStatus?("Translating \(event.language ?? "unknown")")
-        translatorProcess?.sendLine(event.jsonLine(id: id, issuedAt: issuedAt, browserContext: browserContext))
+
+        if direct {
+            onStatus?("Direct Chinese \(event.language ?? "unknown")")
+        } else {
+            onStatus?("Translating \(event.language ?? "unknown")")
+        }
+
+        translatorProcess?.sendLine(
+            event.jsonLine(
+                id: id,
+                issuedAt: issuedAt,
+                browserContext: browserContext,
+                direct: direct
+            )
+        )
     }
 
     private func handleTranslatorLine(_ line: String) {
@@ -151,5 +164,55 @@ final class TranscriptionPipeline {
         submittedAtByTranslationID = submittedAtByTranslationID.filter { id, _ in
             id >= minimumID
         }
+    }
+}
+
+private final class SystemOutputVolumeProvider {
+    private let cacheDuration: TimeInterval = 0.5
+    private let lock = NSLock()
+    private var cachedIsMutedOrSilent = false
+    private var cachedAt: Date = .distantPast
+
+    func isMutedOrSilent() -> Bool {
+        let now = Date()
+
+        lock.lock()
+        if now.timeIntervalSince(cachedAt) < cacheDuration {
+            let value = cachedIsMutedOrSilent
+            lock.unlock()
+            return value
+        }
+        lock.unlock()
+
+        let value = readIsMutedOrSilent()
+
+        lock.lock()
+        cachedAt = now
+        cachedIsMutedOrSilent = value
+        lock.unlock()
+
+        return value
+    }
+
+    private func readIsMutedOrSilent() -> Bool {
+        let source = """
+        set volumeSettings to get volume settings
+        set isMuted to output muted of volumeSettings
+        set outputLevel to output volume of volumeSettings
+        if isMuted or outputLevel is 0 then return "1"
+        return "0"
+        """
+
+        guard let script = NSAppleScript(source: source) else {
+            return false
+        }
+
+        var error: NSDictionary?
+        let descriptor = script.executeAndReturnError(&error)
+        guard error == nil, let value = descriptor.stringValue else {
+            return false
+        }
+
+        return value == "1"
     }
 }
