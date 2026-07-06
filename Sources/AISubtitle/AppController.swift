@@ -7,6 +7,7 @@ final class AppController: NSObject {
     private var config: AppConfig?
     private var captureService: AudioCaptureService?
     private var pipeline: TranscriptionPipeline?
+    private let heliumContextProvider = HeliumTabContextProvider()
     private var statusItem: NSStatusItem?
     private var isRunning = false
 
@@ -53,7 +54,13 @@ final class AppController: NSObject {
             config = loaded.config
             overlay.showStatus("Config: \(loaded.source)")
 
-            let pipeline = TranscriptionPipeline(config: loaded.config, workingDirectory: workingDirectory)
+            let pipeline = TranscriptionPipeline(
+                config: loaded.config,
+                workingDirectory: workingDirectory,
+                browserContextProvider: { [weak self] in
+                    self?.heliumContextProvider.currentContext()
+                }
+            )
             pipeline.onSubtitle = { [weak self] text, source, usage in
                 self?.overlay.showSubtitle(text, source: source, usage: usage)
             }

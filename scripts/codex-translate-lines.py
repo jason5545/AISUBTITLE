@@ -8,6 +8,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 from datetime import datetime, timezone
 
 
@@ -56,8 +57,10 @@ TIMEOUT_SECONDS = float(os.environ.get("AISUBTITLE_TRANSLATE_TIMEOUT_SECONDS", "
 DRAIN_SECONDS = float(os.environ.get("CODEX_TRANSLATE_DRAIN_SECONDS", "0.02"))
 CLINE_WEEKLY_LIMIT_HOURS = float(os.environ.get("CLINE_USAGE_WEEKLY_LIMIT_HOURS", "5"))
 CLINE_MONTHLY_LIMIT_HOURS = float(os.environ.get("CLINE_USAGE_MONTHLY_LIMIT_HOURS", str(CLINE_WEEKLY_LIMIT_HOURS * 4)))
+SESSION_HISTORY_LIMIT = int(os.environ.get("AISUBTITLE_TRANSLATE_SESSION_HISTORY_LIMIT", "6"))
 
 openrouter_session_cost = 0.0
+translation_sessions: dict[str, list[dict[str, str]]] = {}
 
 
 class LineReader:
@@ -151,15 +154,84 @@ def request_headers(api_key: str) -> dict[str, str]:
     return headers
 
 
-def parse_line(line: str) -> tuple[str, int | None]:
+def parse_line(line: str) -> dict[str, object]:
     try:
         payload = json.loads(line)
     except json.JSONDecodeError:
-        return line, None
+        return {"text": line}
 
     text = payload.get("text", line)
     source_id = payload.get("id")
-    return str(text), source_id if isinstance(source_id, int) else None
+    parsed: dict[str, object] = {"text": str(text)}
+    if isinstance(source_id, int):
+        parsed["id"] = source_id
+
+    for key in ("context_url", "context_title", "context_source"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            parsed[key] = value.strip()
+
+    return parsed
+
+
+def canonical_session_key(url: object) -> str | None:
+    if not isinstance(url, str):
+        return None
+
+    raw = url.strip()
+    if not raw:
+        return None
+
+    parsed = urllib.parse.urlsplit(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return raw
+
+    ignored_query_keys = {
+        "fbclid",
+        "gclid",
+        "igshid",
+        "mc_cid",
+        "mc_eid",
+        "msclkid",
+        "spm",
+    }
+    query_items = []
+    for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+        lower_key = key.lower()
+        if lower_key.startswith("utm_") or lower_key in ignored_query_keys:
+            continue
+        query_items.append((key, value))
+
+    normalized_query = urllib.parse.urlencode(query_items, doseq=True)
+    normalized_path = parsed.path or "/"
+    if normalized_path != "/":
+        normalized_path = normalized_path.rstrip("/")
+
+    return urllib.parse.urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            normalized_path,
+            normalized_query,
+            "",
+        )
+    )
+
+
+def session_history(session_key: str | None) -> list[dict[str, str]]:
+    if not session_key:
+        return []
+    return translation_sessions.get(session_key, [])
+
+
+def record_session_turn(session_key: str | None, source_text: str, translated_text: str) -> None:
+    if not session_key:
+        return
+
+    history = translation_sessions.setdefault(session_key, [])
+    history.append({"source": source_text, "translation": translated_text})
+    if len(history) > SESSION_HISTORY_LIMIT:
+        del history[: len(history) - SESSION_HISTORY_LIMIT]
 
 
 def current_month_key() -> str:
@@ -265,7 +337,44 @@ def usage_metadata(response: dict[str, object], elapsed: float) -> dict[str, obj
     }
 
 
-def request_payload(text: str) -> dict[str, object]:
+def context_lines(context: dict[str, object]) -> list[str]:
+    lines: list[str] = []
+
+    url = context.get("context_url")
+    if isinstance(url, str) and url:
+        source = context.get("context_source")
+        source_note = f" ({source})" if isinstance(source, str) and source else ""
+        lines.append(f"Page URL{source_note}: {url}")
+
+    title = context.get("context_title")
+    if isinstance(title, str) and title:
+        lines.append(f"Page title: {title}")
+
+    history = context.get("session_history")
+    if isinstance(history, list) and history:
+        lines.append("Recent same-URL subtitle context:")
+        for item in history[-SESSION_HISTORY_LIMIT:]:
+            if not isinstance(item, dict):
+                continue
+            source_text = str(item.get("source", "")).strip()
+            translation = str(item.get("translation", "")).strip()
+            if source_text and translation:
+                lines.append(f"- Source: {source_text}")
+                lines.append(f"  zh-TW: {translation}")
+
+    return lines
+
+
+def request_payload(text: str, context: dict[str, object]) -> dict[str, object]:
+    user_parts = ["/no_think"]
+    context_part = "\n".join(context_lines(context))
+    if context_part:
+        user_parts.append(
+            "Use this page/session context only to resolve names, pronouns, and terminology. "
+            "Do not mention the context in the output.\n" + context_part
+        )
+    user_parts.append("Translate this subtitle to zh-TW:\n" + text)
+
     return {
         "model": MODEL,
         "messages": [
@@ -280,7 +389,7 @@ def request_payload(text: str) -> dict[str, object]:
             },
             {
                 "role": "user",
-                "content": "/no_think\nTranslate this subtitle to zh-TW:\n" + text,
+                "content": "\n\n".join(user_parts),
             },
         ],
         "stream": False,
@@ -314,8 +423,8 @@ def extract_translation(response: dict[str, object]) -> str:
     return text.strip() if isinstance(text, str) else ""
 
 
-def translate(text: str, api_key: str) -> tuple[str, dict[str, object] | None] | None:
-    body = json.dumps(request_payload(text), ensure_ascii=False).encode("utf-8")
+def translate(text: str, api_key: str, context: dict[str, object]) -> tuple[str, dict[str, object] | None] | None:
+    body = json.dumps(request_payload(text, context), ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         API_URL,
         data=body,
@@ -354,7 +463,14 @@ def translate(text: str, api_key: str) -> tuple[str, dict[str, object] | None] |
     if metadata:
         usage_note = " " + str(metadata.get("display", ""))
 
-    log(f"{PROVIDER} translation ok model={MODEL} reasoning={REASONING} elapsed={elapsed:.2f}s{usage_note}")
+    context_note = ""
+    session_key = context.get("session_key")
+    if isinstance(session_key, str) and session_key:
+        context_source = context.get("context_source")
+        source_text = context_source if isinstance(context_source, str) and context_source else "context"
+        context_note = f" context={source_text} session={session_key[:120]}"
+
+    log(f"{PROVIDER} translation ok model={MODEL} reasoning={REASONING} elapsed={elapsed:.2f}s{usage_note}{context_note}")
     return translated, metadata
 
 
@@ -378,19 +494,30 @@ def main() -> int:
         if dropped:
             log(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} live translator dropped {dropped} stale ASR line(s)")
 
-        text, source_id = parse_line(line)
+        parsed = parse_line(line)
+        text = str(parsed.get("text", "")).strip()
+        source_id = parsed.get("id")
         text = text.strip()
         if not text:
             continue
 
-        result = translate(text, api_key)
+        session_key = canonical_session_key(parsed.get("context_url"))
+        parsed["session_key"] = session_key or ""
+        parsed["session_history"] = session_history(session_key)
+
+        result = translate(text, api_key, parsed)
         if result is None:
             continue
 
         translated, metadata = result
+        record_session_turn(session_key, text, translated)
+
         payload: dict[str, object] = {"text": translated}
-        if source_id is not None:
+        if isinstance(source_id, int):
             payload["id"] = source_id
+        if session_key:
+            payload["context_url"] = parsed.get("context_url")
+            payload["session_key"] = session_key
         if metadata is not None:
             payload["usage"] = metadata
             display = metadata.get("display")

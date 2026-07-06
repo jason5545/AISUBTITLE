@@ -1,5 +1,11 @@
 import Foundation
 
+struct BrowserContext {
+    var url: String
+    var title: String?
+    var source: String
+}
+
 struct TranscriptEvent {
     var text: String
     var language: String?
@@ -39,7 +45,12 @@ struct TranscriptEvent {
         return TranscriptEvent(text: cleanText, language: language, isFinal: isFinal)
     }
 
-    func jsonLine(targetLanguage: String = "zh-Hant-TW", id: Int? = nil, issuedAt: TimeInterval? = nil) -> String {
+    func jsonLine(
+        targetLanguage: String = "zh-Hant-TW",
+        id: Int? = nil,
+        issuedAt: TimeInterval? = nil,
+        browserContext: BrowserContext? = nil
+    ) -> String {
         var object: [String: Any] = [
             "text": text,
             "is_final": isFinal,
@@ -53,6 +64,13 @@ struct TranscriptEvent {
         }
         if let issuedAt {
             object["issued_at"] = issuedAt
+        }
+        if let browserContext {
+            object["context_url"] = browserContext.url
+            object["context_source"] = browserContext.source
+            if let title = browserContext.title, !title.isEmpty {
+                object["context_title"] = title
+            }
         }
 
         guard let data = try? JSONSerialization.data(withJSONObject: object),

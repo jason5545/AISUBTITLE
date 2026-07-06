@@ -7,9 +7,13 @@ macOS floating subtitle pipeline:
 3. Send non-Chinese ASR segments to OpenRouter Gemini 3.1 Flash Lite for Traditional Chinese translation.
 4. Show translated text in an always-on-top floating window.
 
+When Helium allows Apple Events JavaScript, AISubtitle scans Helium tabs for the one that is actually playing audio/video. The sounded tab URL becomes the translation session key, and recent same-URL subtitle turns are sent to Gemini as context. If that Helium setting is disabled, AISubtitle falls back to the active tab URL.
+
 ## Real Run
 
 Helium must be running. The first capture run will need macOS Screen Recording permission for the terminal or packaged app that launches this.
+
+For precise sounded-tab context, enable Helium's `View > Developer > Allow JavaScript from Apple Events`, and allow AISubtitle to control Helium when macOS asks.
 
 ```bash
 ./scripts/run-real.sh

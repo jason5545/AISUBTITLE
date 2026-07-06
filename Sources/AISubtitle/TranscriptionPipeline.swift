@@ -9,6 +9,7 @@ final class TranscriptionPipeline {
     private let maximumAllowedSegmentsBehind = 3
     private let config: AppConfig
     private let workingDirectory: URL
+    private let browserContextProvider: (() -> BrowserContext?)?
     private let stateLock = NSLock()
     private var asrProcess: StreamingProcess?
     private var translatorProcess: StreamingProcess?
@@ -16,9 +17,14 @@ final class TranscriptionPipeline {
     private var latestSubmittedTranslationID = 0
     private var submittedAtByTranslationID: [Int: TimeInterval] = [:]
 
-    init(config: AppConfig, workingDirectory: URL) {
+    init(
+        config: AppConfig,
+        workingDirectory: URL,
+        browserContextProvider: (() -> BrowserContext?)? = nil
+    ) {
         self.config = config
         self.workingDirectory = workingDirectory
+        self.browserContextProvider = browserContextProvider
     }
 
     func start() throws {
@@ -83,8 +89,9 @@ final class TranscriptionPipeline {
 
         let issuedAt = Date().timeIntervalSince1970
         let id = allocateTranslationID(issuedAt: issuedAt)
+        let browserContext = browserContextProvider?()
         onStatus?("Translating \(event.language ?? "unknown")")
-        translatorProcess?.sendLine(event.jsonLine(id: id, issuedAt: issuedAt))
+        translatorProcess?.sendLine(event.jsonLine(id: id, issuedAt: issuedAt, browserContext: browserContext))
     }
 
     private func handleTranslatorLine(_ line: String) {

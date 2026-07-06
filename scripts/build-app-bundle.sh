@@ -57,6 +57,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
   <string>14.0</string>
   <key>LSUIElement</key>
   <true/>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>AISubtitle reads the Helium tab URL and title to keep translation context for live subtitles.</string>
 </dict>
 </plist>
 PLIST
