@@ -9,10 +9,11 @@ final class AudioCaptureService: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private var converter: PCMConverter?
     private let sampleQueue = DispatchQueue(label: "ai.subtitle.capture.audio")
+    private let targetLookupTimeout: TimeInterval = 8.0
+    private let targetLookupRetryDelayNanoseconds: UInt64 = 300_000_000
 
     func start(config: AppConfig) async throws {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        let target = try findTargetApplication(in: content, config: config)
+        let (content, target) = try await waitForTargetApplication(config: config)
         let display = displayForTargetApplication(target, in: content) ?? content.displays.first
 
         guard let display else {
@@ -69,7 +70,27 @@ final class AudioCaptureService: NSObject, SCStreamOutput, SCStreamDelegate {
         onStatus?("Capture stopped: \(error.localizedDescription)")
     }
 
-    private func findTargetApplication(in content: SCShareableContent, config: AppConfig) throws -> SCRunningApplication {
+    private func waitForTargetApplication(config: AppConfig) async throws -> (SCShareableContent, SCRunningApplication) {
+        let startedAt = Date()
+
+        while true {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            if let target = findTargetApplication(in: content, config: config) {
+                return (content, target)
+            }
+
+            let elapsed = Date().timeIntervalSince(startedAt)
+            if elapsed >= targetLookupTimeout {
+                throw targetApplicationNotFoundError(in: content, config: config)
+            }
+
+            let targetName = config.targetApplicationNames.first ?? "target app"
+            onStatus?("Waiting for \(targetName)")
+            try await Task.sleep(nanoseconds: targetLookupRetryDelayNanoseconds)
+        }
+    }
+
+    private func findTargetApplication(in content: SCShareableContent, config: AppConfig) -> SCRunningApplication? {
         let normalizedBundleIDs = Set(config.targetBundleIdentifiers.map { $0.lowercased() })
         let normalizedNames = config.targetApplicationNames.map { $0.lowercased() }
 
@@ -87,11 +108,15 @@ final class AudioCaptureService: NSObject, SCStreamOutput, SCStreamDelegate {
             return nameMatch
         }
 
+        return nil
+    }
+
+    private func targetApplicationNotFoundError(in content: SCShareableContent, config: AppConfig) -> AppError {
         let available = content.applications
             .map { "\($0.applicationName)(\($0.bundleIdentifier))" }
             .sorted()
 
-        throw AppError.targetApplicationNotFound(
+        return AppError.targetApplicationNotFound(
             names: config.targetApplicationNames,
             bundleIdentifiers: config.targetBundleIdentifiers,
             available: available

@@ -48,6 +48,9 @@ final class AppController: NSObject {
             return
         }
 
+        var startingCaptureService: AudioCaptureService?
+        var startingPipeline: TranscriptionPipeline?
+
         do {
             overlay.showStatus("Loading config")
             let loaded = try AppConfig.load(arguments: CommandLine.arguments, workingDirectory: workingDirectory)
@@ -67,7 +70,7 @@ final class AppController: NSObject {
             pipeline.onStatus = { [weak self] status in
                 self?.overlay.showStatus(status)
             }
-            try pipeline.start()
+            startingPipeline = pipeline
 
             let captureService = AudioCaptureService()
             captureService.onPCM = { [weak pipeline] data in
@@ -76,9 +79,13 @@ final class AppController: NSObject {
             captureService.onStatus = { [weak self] status in
                 self?.overlay.showStatus(status)
             }
+            startingCaptureService = captureService
 
             overlay.showStatus("Looking for Helium")
             try await captureService.start(config: loaded.config)
+
+            overlay.showStatus("Starting subtitle pipeline")
+            try pipeline.start()
 
             self.pipeline = pipeline
             self.captureService = captureService
@@ -86,7 +93,8 @@ final class AppController: NSObject {
             updateMenu()
         } catch {
             overlay.showStatus(error.localizedDescription)
-            pipeline?.stop()
+            startingPipeline?.stop()
+            await startingCaptureService?.stop()
             pipeline = nil
             captureService = nil
             isRunning = false

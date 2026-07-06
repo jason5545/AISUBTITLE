@@ -8,9 +8,11 @@ import shutil
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
+import concurrent.futures
+import http.client
+import threading
 import urllib.parse
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 
@@ -63,12 +65,33 @@ SESSION_HISTORY_LIMIT = int(os.environ.get("AISUBTITLE_TRANSLATE_SESSION_HISTORY
 OPENCC_CONFIG = os.environ.get("AISUBTITLE_OPENCC_CONFIG", "s2twp.json").strip() or "s2twp.json"
 OPENCC_BIN = os.environ.get("AISUBTITLE_OPENCC_BIN", "").strip()
 
+API_PARTS = urllib.parse.urlsplit(API_URL)
+API_SCHEME = API_PARTS.scheme.lower()
+API_HOST = API_PARTS.hostname or ""
+API_PORT = API_PARTS.port
+API_PATH = urllib.parse.urlunsplit(("", "", API_PARTS.path or "/", API_PARTS.query, ""))
+
+MAX_IN_FLIGHT_TRANSLATIONS = 3
+
 openrouter_session_cost = 0.0
 translation_sessions: dict[str, list[dict[str, str]]] = {}
 opencc_converter: object | None = None
 opencc_import_failed = False
 opencc_cli_path: str | None = None
 missing_api_key_logged = False
+
+_http_connection_local = threading.local()
+_log_lock = threading.Lock()
+_translation_sessions_lock = threading.Lock()
+_usage_state_lock = threading.RLock()
+
+_CONNECTION_ERRORS = (
+    http.client.HTTPException,
+    BrokenPipeError,
+    ConnectionResetError,
+    TimeoutError,
+    OSError,
+)
 
 SUPPLEMENTARY_OPENCC_MAPPINGS = (
     ("優盤", "隨身碟"),
@@ -85,6 +108,16 @@ JAPANESE_NAME_OPENCC_REVERTS = (
     ("裡菜", "里菜"),
     ("裡帆", "里帆"),
 )
+
+
+@dataclass(frozen=True)
+class TranslationResult:
+    source_id: int | None
+    source_text: str
+    translated_text: str
+    metadata: dict[str, object] | None
+    session_key: str | None
+    context_url: object
 
 
 class LineReader:
@@ -142,8 +175,9 @@ class LineReader:
 
 
 def log(message: str) -> None:
-    with open(LOG_FILE, "a", encoding="utf-8") as handle:
-        handle.write(message + "\n")
+    with _log_lock:
+        with open(LOG_FILE, "a", encoding="utf-8") as handle:
+            handle.write(message + "\n")
 
 
 def load_secret_file() -> None:
@@ -253,17 +287,19 @@ def canonical_session_key(url: object) -> str | None:
 def session_history(session_key: str | None) -> list[dict[str, str]]:
     if not session_key:
         return []
-    return translation_sessions.get(session_key, [])
+    with _translation_sessions_lock:
+        return [dict(item) for item in translation_sessions.get(session_key, [])]
 
 
 def record_session_turn(session_key: str | None, source_text: str, translated_text: str) -> None:
     if not session_key:
         return
 
-    history = translation_sessions.setdefault(session_key, [])
-    history.append({"source": source_text, "translation": translated_text})
-    if len(history) > SESSION_HISTORY_LIMIT:
-        del history[: len(history) - SESSION_HISTORY_LIMIT]
+    with _translation_sessions_lock:
+        history = translation_sessions.setdefault(session_key, [])
+        history.append({"source": source_text, "translation": translated_text})
+        if len(history) > SESSION_HISTORY_LIMIT:
+            del history[: len(history) - SESSION_HISTORY_LIMIT]
 
 
 def current_month_key() -> str:
@@ -271,26 +307,28 @@ def current_month_key() -> str:
 
 
 def load_usage_state() -> dict[str, object]:
-    try:
-        with open(USAGE_STATE_FILE, encoding="utf-8") as handle:
-            payload = json.load(handle)
-            return payload if isinstance(payload, dict) else {}
-    except FileNotFoundError:
-        return {}
-    except Exception as error:
-        log(f"usage state read failed: {error!r}")
-        return {}
+    with _usage_state_lock:
+        try:
+            with open(USAGE_STATE_FILE, encoding="utf-8") as handle:
+                payload = json.load(handle)
+                return payload if isinstance(payload, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as error:
+            log(f"usage state read failed: {error!r}")
+            return {}
 
 
 def save_usage_state(state: dict[str, object]) -> None:
-    temp_path = USAGE_STATE_FILE + ".tmp"
-    try:
-        with open(temp_path, "w", encoding="utf-8") as handle:
-            json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.replace(temp_path, USAGE_STATE_FILE)
-    except Exception as error:
-        log(f"usage state write failed: {error!r}")
+    with _usage_state_lock:
+        temp_path = USAGE_STATE_FILE + ".tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as handle:
+                json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.replace(temp_path, USAGE_STATE_FILE)
+        except Exception as error:
+            log(f"usage state write failed: {error!r}")
 
 
 def numeric(value: object) -> float | None:
@@ -325,29 +363,31 @@ def openrouter_usage_metadata(response: dict[str, object], elapsed: float) -> di
             "display": "OR cost n/a",
         }
 
-    state = load_usage_state()
-    openrouter_state = state.get("openrouter")
-    if not isinstance(openrouter_state, dict):
-        openrouter_state = {}
+    with _usage_state_lock:
+        state = load_usage_state()
+        openrouter_state = state.get("openrouter")
+        if not isinstance(openrouter_state, dict):
+            openrouter_state = {}
 
-    month_key = current_month_key()
-    if openrouter_state.get("month") != month_key:
-        openrouter_state = {"month": month_key, "month_cost": 0.0}
+        month_key = current_month_key()
+        if openrouter_state.get("month") != month_key:
+            openrouter_state = {"month": month_key, "month_cost": 0.0}
 
-    month_cost = numeric(openrouter_state.get("month_cost")) or 0.0
-    month_cost += cost
-    openrouter_session_cost += cost
-    openrouter_state["month"] = month_key
-    openrouter_state["month_cost"] = month_cost
-    state["openrouter"] = openrouter_state
-    save_usage_state(state)
+        month_cost = numeric(openrouter_state.get("month_cost")) or 0.0
+        month_cost += cost
+        openrouter_session_cost += cost
+        session_cost = openrouter_session_cost
+        openrouter_state["month"] = month_key
+        openrouter_state["month_cost"] = month_cost
+        state["openrouter"] = openrouter_state
+        save_usage_state(state)
 
     return {
         "provider": "openrouter",
         "model": MODEL,
         "elapsed_seconds": round(elapsed, 3),
         "cost": cost,
-        "session_cost": openrouter_session_cost,
+        "session_cost": session_cost,
         "month": month_key,
         "month_cost": month_cost,
         "prompt_tokens": usage.get("prompt_tokens"),
@@ -516,7 +556,7 @@ def request_payload(text: str, context: dict[str, object]) -> dict[str, object]:
         )
     user_parts.append("Translate this subtitle to zh-TW:\n" + text)
 
-    return {
+    payload: dict[str, object] = {
         "model": MODEL,
         "messages": [
             {
@@ -538,6 +578,64 @@ def request_payload(text: str, context: dict[str, object]) -> dict[str, object]:
         "max_tokens": MAX_TOKENS,
         "reasoning_effort": REASONING,
     }
+    if PROVIDER == "openrouter":
+        payload["provider"] = {"sort": "latency"}
+    return payload
+
+
+def close_persistent_connection() -> None:
+    connection = getattr(_http_connection_local, "connection", None)
+    if connection is not None:
+        try:
+            connection.close()
+        except Exception:
+            pass
+    _http_connection_local.connection = None
+
+
+def persistent_connection() -> http.client.HTTPSConnection:
+    if API_SCHEME != "https" or not API_HOST:
+        raise ValueError(f"unsupported API_URL for persistent HTTPS connection: {API_URL!r}")
+
+    connection = getattr(_http_connection_local, "connection", None)
+    if connection is None:
+        connection = http.client.HTTPSConnection(API_HOST, API_PORT, timeout=TIMEOUT_SECONDS)
+        _http_connection_local.connection = connection
+    return connection
+
+
+def post_json_once(api_key: str, body: bytes) -> tuple[int, str]:
+    connection = persistent_connection()
+    connection.request("POST", API_PATH, body=body, headers=request_headers(api_key))
+    response = connection.getresponse()
+    try:
+        raw_response = response.read().decode("utf-8", errors="replace")
+        status = response.status
+        should_close = response.will_close
+    except Exception:
+        close_persistent_connection()
+        raise
+
+    if should_close:
+        close_persistent_connection()
+    return status, raw_response
+
+
+def post_json_with_retry(api_key: str, body: bytes) -> tuple[int, str]:
+    last_error: BaseException | None = None
+    for attempt in range(2):
+        try:
+            return post_json_once(api_key, body)
+        except _CONNECTION_ERRORS as error:
+            last_error = error
+            close_persistent_connection()
+            if attempt == 0:
+                continue
+            raise
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("persistent HTTP request failed without an exception")
 
 
 def extract_translation(response: dict[str, object]) -> str:
@@ -566,24 +664,18 @@ def extract_translation(response: dict[str, object]) -> str:
 
 def translate(text: str, api_key: str, context: dict[str, object]) -> tuple[str, dict[str, object] | None] | None:
     body = json.dumps(request_payload(text, context), ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        API_URL,
-        data=body,
-        headers=request_headers(api_key),
-        method="POST",
-    )
 
     started_at = time.perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-            raw_response = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")[:1000]
-        log(f"{PROVIDER} translation failed status={error.code}: {detail}")
-        print(f"{PROVIDER} translation failed; logged to {LOG_FILE}", file=sys.stderr, flush=True)
-        return None
+        status, raw_response = post_json_with_retry(api_key, body)
     except Exception as error:
         log(f"{PROVIDER} translation failed before response: {error!r}")
+        print(f"{PROVIDER} translation failed; logged to {LOG_FILE}", file=sys.stderr, flush=True)
+        return None
+
+    if status >= 400:
+        detail = raw_response[:1000]
+        log(f"{PROVIDER} translation failed status={status}: {detail}")
         print(f"{PROVIDER} translation failed; logged to {LOG_FILE}", file=sys.stderr, flush=True)
         return None
 
@@ -615,38 +707,113 @@ def translate(text: str, api_key: str, context: dict[str, object]) -> tuple[str,
     return translated, metadata
 
 
+def run_translation_job(
+    text: str,
+    source_id: int | None,
+    api_key: str,
+    context: dict[str, object],
+) -> TranslationResult | None:
+    result = translate(text, api_key, context)
+    if result is None:
+        return None
+
+    translated, metadata = result
+    session_key = context.get("session_key")
+    return TranslationResult(
+        source_id=source_id,
+        source_text=text,
+        translated_text=translated,
+        metadata=metadata,
+        session_key=session_key if isinstance(session_key, str) and session_key else None,
+        context_url=context.get("context_url"),
+    )
+
+
+def result_payload(result: TranslationResult) -> dict[str, object]:
+    payload: dict[str, object] = {"text": result.translated_text}
+    if isinstance(result.source_id, int):
+        payload["id"] = result.source_id
+    if result.session_key:
+        payload["context_url"] = result.context_url
+        payload["session_key"] = result.session_key
+    if result.metadata is not None:
+        payload["usage"] = result.metadata
+        display = result.metadata.get("display")
+        if isinstance(display, str) and display:
+            payload["usage_display"] = display
+    return payload
+
+
 def main() -> int:
     global missing_api_key_logged
 
     load_secret_file()
     key_name = api_key_name()
 
+    last_emitted_id: int | None = None
+    emit_lock = threading.Lock()
+    in_flight = threading.BoundedSemaphore(MAX_IN_FLIGHT_TRANSLATIONS)
+
+    def emit_result(result: TranslationResult | None) -> None:
+        nonlocal last_emitted_id
+
+        if result is None:
+            return
+
+        with emit_lock:
+            source_id = result.source_id
+            if isinstance(source_id, int):
+                if last_emitted_id is not None and source_id <= last_emitted_id:
+                    log(f"{PROVIDER} skipped out-of-order id={source_id} last_emitted_id={last_emitted_id}")
+                    return
+                last_emitted_id = source_id
+
+            record_session_turn(result.session_key, result.source_text, result.translated_text)
+            print(json.dumps(result_payload(result), ensure_ascii=False), flush=True)
+
+    def finish_future(future: concurrent.futures.Future[TranslationResult | None]) -> None:
+        try:
+            emit_result(future.result())
+        except Exception as error:
+            log(f"{PROVIDER} translation worker failed: {error!r}")
+            print(f"{PROVIDER} translation failed; logged to {LOG_FILE}", file=sys.stderr, flush=True)
+        finally:
+            in_flight.release()
+
     reader = LineReader(sys.stdin.fileno())
-    while True:
-        line = reader.read_line()
-        if line is None:
-            break
-        if not line:
-            continue
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_IN_FLIGHT_TRANSLATIONS) as executor:
+        while True:
+            line = reader.read_line()
+            if line is None:
+                break
+            if not line:
+                continue
 
-        line, dropped = reader.drain_to_latest(line, DRAIN_SECONDS)
-        if dropped:
-            log(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} live translator dropped {dropped} stale ASR line(s)")
+            parsed = parse_line(line)
+            text = str(parsed.get("text", "")).strip()
+            source_id = parsed.get("id")
+            source_id = source_id if isinstance(source_id, int) else None
+            if not text:
+                continue
 
-        parsed = parse_line(line)
-        text = str(parsed.get("text", "")).strip()
-        source_id = parsed.get("id")
-        text = text.strip()
-        if not text:
-            continue
+            session_key = canonical_session_key(parsed.get("context_url"))
+            parsed["session_key"] = session_key or ""
+            parsed["session_history"] = session_history(session_key)
 
-        session_key = canonical_session_key(parsed.get("context_url"))
-        parsed["session_key"] = session_key or ""
-        parsed["session_history"] = session_history(session_key)
+            if parsed.get("direct") is True:
+                translated, metadata = direct_process(text)
+                emit_result(
+                    TranslationResult(
+                        source_id=source_id,
+                        source_text=text,
+                        translated_text=translated,
+                        metadata=metadata,
+                        session_key=session_key,
+                        context_url=parsed.get("context_url"),
+                    )
+                )
+                continue
 
-        if parsed.get("direct") is True:
-            translated, metadata = direct_process(text)
-        else:
             api_key = os.environ.get(key_name, "").strip()
             if not api_key:
                 if not missing_api_key_logged:
@@ -654,26 +821,13 @@ def main() -> int:
                     missing_api_key_logged = True
                 continue
 
-            result = translate(text, api_key, parsed)
-            if result is None:
-                continue
-
-            translated, metadata = result
-        record_session_turn(session_key, text, translated)
-
-        payload: dict[str, object] = {"text": translated}
-        if isinstance(source_id, int):
-            payload["id"] = source_id
-        if session_key:
-            payload["context_url"] = parsed.get("context_url")
-            payload["session_key"] = session_key
-        if metadata is not None:
-            payload["usage"] = metadata
-            display = metadata.get("display")
-            if isinstance(display, str) and display:
-                payload["usage_display"] = display
-
-        print(json.dumps(payload, ensure_ascii=False), flush=True)
+            in_flight.acquire()
+            try:
+                future = executor.submit(run_translation_job, text, source_id, api_key, dict(parsed))
+            except Exception:
+                in_flight.release()
+                raise
+            future.add_done_callback(finish_future)
 
     return 0
 

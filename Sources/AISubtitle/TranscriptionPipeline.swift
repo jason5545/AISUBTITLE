@@ -52,8 +52,14 @@ final class TranscriptionPipeline {
             self?.onStatus?("Translator stopped: \(status)")
         }
 
-        try translatorProcess.start()
-        try asrProcess.start()
+        do {
+            try translatorProcess.start()
+            try asrProcess.start()
+        } catch {
+            asrProcess.stop()
+            translatorProcess.stop()
+            throw error
+        }
 
         self.asrProcess = asrProcess
         self.translatorProcess = translatorProcess
