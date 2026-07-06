@@ -7,14 +7,17 @@ final class AppController: NSObject {
     private var config: AppConfig?
     private var captureService: AudioCaptureService?
     private var pipeline: TranscriptionPipeline?
+    private var overlayIPCServer: OverlayIPCServer?
     private let heliumContextProvider = HeliumTabContextProvider()
     private var statusItem: NSStatusItem?
     private var isRunning = false
+    private var externalOverlayActive = false
 
     override init() {
         workingDirectory = Self.resolveWorkingDirectory()
         super.init()
         setupStatusItem()
+        setupOverlayIPC()
     }
 
     private static func resolveWorkingDirectory() -> URL {
@@ -65,9 +68,15 @@ final class AppController: NSObject {
                 }
             )
             pipeline.onSubtitle = { [weak self] text, source, usage in
+                guard self?.externalOverlayActive != true else {
+                    return
+                }
                 self?.overlay.showSubtitle(text, source: source, usage: usage)
             }
             pipeline.onStatus = { [weak self] status in
+                guard self?.externalOverlayActive != true else {
+                    return
+                }
                 self?.overlay.showStatus(status)
             }
             startingPipeline = pipeline
@@ -77,6 +86,9 @@ final class AppController: NSObject {
                 pipeline?.acceptPCM(data)
             }
             captureService.onStatus = { [weak self] status in
+                guard self?.externalOverlayActive != true else {
+                    return
+                }
                 self?.overlay.showStatus(status)
             }
             startingCaptureService = captureService
@@ -122,6 +134,18 @@ final class AppController: NSObject {
         item.button?.title = "AI字幕"
         statusItem = item
         updateMenu()
+    }
+
+    private func setupOverlayIPC() {
+        overlayIPCServer = OverlayIPCServer { [weak self] line in
+            self?.handleOverlayIPC(line)
+        }
+        overlayIPCServer?.start()
+    }
+
+    private func handleOverlayIPC(_ line: String) {
+        externalOverlayActive = !OverlayMessageRenderer.isStopStatus(line)
+        OverlayMessageRenderer.render(line, overlay: overlay)
     }
 
     private func updateMenu() {

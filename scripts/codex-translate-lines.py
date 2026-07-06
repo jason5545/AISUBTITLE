@@ -58,12 +58,16 @@ else:
 
 MAX_TOKENS = int(os.environ.get("AISUBTITLE_TRANSLATE_MAX_TOKENS", "240"))
 TIMEOUT_SECONDS = float(os.environ.get("AISUBTITLE_TRANSLATE_TIMEOUT_SECONDS", "12"))
-DRAIN_SECONDS = float(os.environ.get("CODEX_TRANSLATE_DRAIN_SECONDS", "0.02"))
+DRAIN_SECONDS = float(
+    os.environ.get("AISUBTITLE_TRANSLATE_DRAIN_SECONDS")
+    or os.environ.get("CODEX_TRANSLATE_DRAIN_SECONDS", "0.05")
+)
 CLINE_WEEKLY_LIMIT_HOURS = float(os.environ.get("CLINE_USAGE_WEEKLY_LIMIT_HOURS", "5"))
 CLINE_MONTHLY_LIMIT_HOURS = float(os.environ.get("CLINE_USAGE_MONTHLY_LIMIT_HOURS", str(CLINE_WEEKLY_LIMIT_HOURS * 4)))
 SESSION_HISTORY_LIMIT = int(os.environ.get("AISUBTITLE_TRANSLATE_SESSION_HISTORY_LIMIT", "6"))
 OPENCC_CONFIG = os.environ.get("AISUBTITLE_OPENCC_CONFIG", "s2twp.json").strip() or "s2twp.json"
 OPENCC_BIN = os.environ.get("AISUBTITLE_OPENCC_BIN", "").strip()
+VERBOSE_LOG = os.environ.get("AISUBTITLE_VERBOSE_LOG", "").strip().lower() in {"1", "true", "yes", "on"}
 
 API_PARTS = urllib.parse.urlsplit(API_URL)
 API_SCHEME = API_PARTS.scheme.lower()
@@ -71,7 +75,13 @@ API_HOST = API_PARTS.hostname or ""
 API_PORT = API_PARTS.port
 API_PATH = urllib.parse.urlunsplit(("", "", API_PARTS.path or "/", API_PARTS.query, ""))
 
-MAX_IN_FLIGHT_TRANSLATIONS = 3
+MAX_IN_FLIGHT_TRANSLATIONS = max(
+    1,
+    int(
+        os.environ.get("AISUBTITLE_TRANSLATE_MAX_IN_FLIGHT")
+        or os.environ.get("CODEX_TRANSLATE_MAX_IN_FLIGHT", "3")
+    ),
+)
 
 openrouter_session_cost = 0.0
 translation_sessions: dict[str, list[dict[str, str]]] = {}
@@ -175,9 +185,26 @@ class LineReader:
 
 
 def log(message: str) -> None:
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     with _log_lock:
         with open(LOG_FILE, "a", encoding="utf-8") as handle:
-            handle.write(message + "\n")
+            handle.write(f"{timestamp} pid={os.getpid()} {message}\n")
+
+
+def verbose(message: str) -> None:
+    if VERBOSE_LOG:
+        log("verbose " + message)
+
+
+def preview(text: str, limit: int = 80) -> str:
+    clean = " ".join(text.split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 3] + "..."
+
+
+def seconds_label(value: float | None) -> str:
+    return f"{value:.3f}s" if value is not None else "na"
 
 
 def load_secret_file() -> None:
@@ -231,6 +258,11 @@ def parse_line(line: str) -> dict[str, object]:
     language = payload.get("language")
     if isinstance(language, str) and language.strip():
         parsed["language"] = language.strip()
+
+    for key in ("issued_at", "duration_seconds", "avg_logprob"):
+        value = numeric(payload.get(key))
+        if value is not None:
+            parsed[key] = value
 
     for key in ("context_url", "context_title", "context_source"):
         value = payload.get(key)
@@ -664,31 +696,35 @@ def extract_translation(response: dict[str, object]) -> str:
 
 def translate(text: str, api_key: str, context: dict[str, object]) -> tuple[str, dict[str, object] | None] | None:
     body = json.dumps(request_payload(text, context), ensure_ascii=False).encode("utf-8")
+    source_id = context.get("id")
 
     started_at = time.perf_counter()
+    verbose(f"http-start id={source_id} host={API_HOST} model={MODEL} bytes={len(body)}")
     try:
         status, raw_response = post_json_with_retry(api_key, body)
     except Exception as error:
-        log(f"{PROVIDER} translation failed before response: {error!r}")
-        print(f"{PROVIDER} translation failed; logged to {LOG_FILE}", file=sys.stderr, flush=True)
-        return None
-
-    if status >= 400:
-        detail = raw_response[:1000]
-        log(f"{PROVIDER} translation failed status={status}: {detail}")
+        elapsed = time.perf_counter() - started_at
+        log(f"{PROVIDER} translation failed before response id={source_id} elapsed={elapsed:.3f}s: {error!r}")
         print(f"{PROVIDER} translation failed; logged to {LOG_FILE}", file=sys.stderr, flush=True)
         return None
 
     elapsed = time.perf_counter() - started_at
+    verbose(f"http-response id={source_id} status={status} elapsed={elapsed:.3f}s bytes={len(raw_response)}")
+    if status >= 400:
+        detail = raw_response[:1000]
+        log(f"{PROVIDER} translation failed id={source_id} status={status} elapsed={elapsed:.3f}s: {detail}")
+        print(f"{PROVIDER} translation failed; logged to {LOG_FILE}", file=sys.stderr, flush=True)
+        return None
+
     try:
         payload = json.loads(raw_response)
     except json.JSONDecodeError:
-        log(f"{PROVIDER} translation returned non-JSON after {elapsed:.2f}s")
+        log(f"{PROVIDER} translation returned non-JSON id={source_id} after {elapsed:.2f}s")
         return None
 
     translated = extract_translation(payload)
     if not translated:
-        log(f"{PROVIDER} translation returned empty content after {elapsed:.2f}s model={MODEL}")
+        log(f"{PROVIDER} translation returned empty content id={source_id} after {elapsed:.2f}s model={MODEL}")
         return None
 
     metadata = usage_metadata(payload, elapsed)
@@ -703,7 +739,7 @@ def translate(text: str, api_key: str, context: dict[str, object]) -> tuple[str,
         source_text = context_source if isinstance(context_source, str) and context_source else "context"
         context_note = f" context={source_text} session={session_key[:120]}"
 
-    log(f"{PROVIDER} translation ok model={MODEL} reasoning={REASONING} elapsed={elapsed:.2f}s{usage_note}{context_note}")
+    log(f"{PROVIDER} translation ok id={source_id} model={MODEL} reasoning={REASONING} elapsed={elapsed:.2f}s{usage_note}{context_note}")
     return translated, metadata
 
 
@@ -713,10 +749,26 @@ def run_translation_job(
     api_key: str,
     context: dict[str, object],
 ) -> TranslationResult | None:
+    started_wall = time.time()
+    started = time.perf_counter()
+    issued_at = numeric(context.get("issued_at"))
+    received_at = numeric(context.get("_received_at"))
+    queue_wait = numeric(context.get("_queue_wait_seconds"))
+    issue_age = started_wall - issued_at if issued_at is not None else None
+    input_wait = started_wall - received_at if received_at is not None else None
+    verbose(f"job-start id={source_id} issue_age={seconds_label(issue_age)}")
+    verbose(
+        f"job-context id={source_id} "
+        f"queue_wait={seconds_label(queue_wait)} "
+        f"input_wait={seconds_label(input_wait)} "
+        f"text={preview(text)!r}"
+    )
     result = translate(text, api_key, context)
     if result is None:
+        verbose(f"job-failed id={source_id} elapsed={time.perf_counter() - started:.3f}s")
         return None
 
+    verbose(f"job-done id={source_id} elapsed={time.perf_counter() - started:.3f}s")
     translated, metadata = result
     session_key = context.get("session_key")
     return TranslationResult(
@@ -769,6 +821,7 @@ def main() -> int:
                 last_emitted_id = source_id
 
             record_session_turn(result.session_key, result.source_text, result.translated_text)
+            verbose(f"emit id={source_id} text={preview(result.translated_text)!r}")
             print(json.dumps(result_payload(result), ensure_ascii=False), flush=True)
 
     def finish_future(future: concurrent.futures.Future[TranslationResult | None]) -> None:
@@ -788,20 +841,37 @@ def main() -> int:
                 break
             if not line:
                 continue
+            line, dropped = reader.drain_to_latest(line, DRAIN_SECONDS)
+            if dropped:
+                log(f"{PROVIDER} drained stale input lines dropped={dropped} window={DRAIN_SECONDS:.3f}s")
 
             parsed = parse_line(line)
+            received_at = time.time()
             text = str(parsed.get("text", "")).strip()
             source_id = parsed.get("id")
             source_id = source_id if isinstance(source_id, int) else None
             if not text:
                 continue
+            parsed["_received_at"] = received_at
+            issued_at = numeric(parsed.get("issued_at"))
+            issue_age = received_at - issued_at if issued_at is not None else None
+            verbose(
+                f"recv id={source_id} "
+                f"issue_age={seconds_label(issue_age)} "
+                f"lang={parsed.get('language', 'unknown')} "
+                f"direct={parsed.get('direct') is True} "
+                f"text={preview(text)!r}"
+            )
 
             session_key = canonical_session_key(parsed.get("context_url"))
             parsed["session_key"] = session_key or ""
             parsed["session_history"] = session_history(session_key)
 
             if parsed.get("direct") is True:
+                direct_started = time.perf_counter()
+                verbose(f"direct-start id={source_id}")
                 translated, metadata = direct_process(text)
+                verbose(f"direct-done id={source_id} elapsed={time.perf_counter() - direct_started:.3f}s")
                 emit_result(
                     TranslationResult(
                         source_id=source_id,
@@ -821,7 +891,14 @@ def main() -> int:
                     missing_api_key_logged = True
                 continue
 
+            wait_started = time.perf_counter()
             in_flight.acquire()
+            queue_wait = time.perf_counter() - wait_started
+            parsed["_queue_wait_seconds"] = queue_wait
+            if queue_wait >= 0.05:
+                log(f"{PROVIDER} waited for translation slot id={source_id} queue_wait={queue_wait:.3f}s")
+            else:
+                verbose(f"slot-ready id={source_id} queue_wait={queue_wait:.3f}s")
             try:
                 future = executor.submit(run_translation_job, text, source_id, api_key, dict(parsed))
             except Exception:

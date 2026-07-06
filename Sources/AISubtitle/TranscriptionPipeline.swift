@@ -1,15 +1,17 @@
 import Foundation
+import OSLog
 
 final class TranscriptionPipeline {
     var onSubtitle: ((String, String?, String?) -> Void)?
     var onStatus: ((String) -> Void)?
 
-    private let softStaleLagSeconds: TimeInterval = 4.5
-    private let hardStaleLagSeconds: TimeInterval = 8.0
-    private let maximumAllowedSegmentsBehind = 3
+    private let softStaleLagSeconds: TimeInterval = 2.0
+    private let hardStaleLagSeconds: TimeInterval = 5.0
+    private let maximumAllowedSegmentsBehind = 1
     private let config: AppConfig
     private let workingDirectory: URL
     private let browserContextProvider: (() -> BrowserContext?)?
+    private let logger = Logger(subsystem: "com.jasonchien.AISubtitle", category: "TranscriptionPipeline")
     private let systemOutputVolumeProvider = SystemOutputVolumeProvider()
     private let stateLock = NSLock()
     private var asrProcess: StreamingProcess?
@@ -78,10 +80,12 @@ final class TranscriptionPipeline {
 
     private func handleASRLine(_ line: String) {
         guard let event = TranscriptEvent.parse(line) else {
+            logger.info("asr-unparsed line_chars=\(line.count, privacy: .public)")
             return
         }
 
         guard event.isFinal || config.translatePartialResults else {
+            logger.info("asr-skip-partial lang=\(event.language ?? "unknown", privacy: .public) text_chars=\(event.text.count, privacy: .public)")
             return
         }
 
@@ -90,18 +94,26 @@ final class TranscriptionPipeline {
 
         if !shouldTranslate && !direct {
             onStatus?("Chinese source skipped")
+            logger.info("asr-skip-chinese lang=\(event.language ?? "unknown", privacy: .public) text_chars=\(event.text.count, privacy: .public)")
             return
         }
 
         let issuedAt = Date().timeIntervalSince1970
         let id = allocateTranslationID(issuedAt: issuedAt)
+        let contextStartedAt = Date().timeIntervalSince1970
         let browserContext = browserContextProvider?()
+        let contextElapsed = Date().timeIntervalSince1970 - contextStartedAt
+        logger.info("context-provider id=\(id, privacy: .public) elapsed=\(self.formatSeconds(contextElapsed), privacy: .public)s source=\(browserContext?.source ?? "none", privacy: .public) has_url=\((browserContext?.url.isEmpty == false), privacy: .public)")
 
         if direct {
             onStatus?("Direct Chinese \(event.language ?? "unknown")")
         } else {
             onStatus?("Translating \(event.language ?? "unknown")")
         }
+
+        let mode = direct ? "direct" : "translate"
+        let preSubmitLag = Date().timeIntervalSince1970 - issuedAt
+        logger.info("submit id=\(id, privacy: .public) mode=\(mode, privacy: .public) lang=\(event.language ?? "unknown", privacy: .public) final=\(event.isFinal, privacy: .public) pre_submit_lag=\(self.formatSeconds(preSubmitLag), privacy: .public)s text_chars=\(event.text.count, privacy: .public)")
 
         translatorProcess?.sendLine(
             event.jsonLine(
@@ -115,13 +127,18 @@ final class TranscriptionPipeline {
 
     private func handleTranslatorLine(_ line: String) {
         guard let event = TranslationEvent.parse(line) else {
+            logger.info("translator-unparsed line_chars=\(line.count, privacy: .public)")
             return
         }
         let now = Date().timeIntervalSince1970
-        if let id = event.id, shouldDropTranslation(id: id, now: now) {
+        let lag = submissionLag(id: event.id, now: now)
+        logger.info("translator-recv id=\(event.id ?? -1, privacy: .public) lag=\(self.formatSeconds(lag), privacy: .public)s usage=\(event.usageDisplay ?? "none", privacy: .public) text_chars=\(event.text.count, privacy: .public)")
+        if let id = event.id, let dropReason = dropTranslationReason(id: id, now: now) {
+            logger.info("translator-drop id=\(id, privacy: .public) reason=\(dropReason, privacy: .public)")
             return
         }
         noteSubtitleDisplayed(id: event.id)
+        logger.info("subtitle-display id=\(event.id ?? -1, privacy: .public) lag=\(self.formatSeconds(lag), privacy: .public)s")
         onSubtitle?(event.text, "zh-Hant", event.usageDisplay)
     }
 
@@ -136,23 +153,42 @@ final class TranscriptionPipeline {
         return nextTranslationID
     }
 
-    private func shouldDropTranslation(id: Int, now: TimeInterval) -> Bool {
+    private func submissionLag(id: Int?, now: TimeInterval) -> TimeInterval? {
+        guard let id else {
+            return nil
+        }
+
         stateLock.lock()
         defer { stateLock.unlock() }
 
         guard let issuedAt = submittedAtByTranslationID[id] else {
-            return false
+            return nil
+        }
+
+        return max(0, now - issuedAt)
+    }
+
+    private func dropTranslationReason(id: Int, now: TimeInterval) -> String? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+
+        guard let issuedAt = submittedAtByTranslationID[id] else {
+            return nil
         }
 
         let lagSeconds = max(0, now - issuedAt)
         let segmentsBehind = latestSubmittedTranslationID - id
 
         if lagSeconds >= hardStaleLagSeconds {
-            return true
+            return "hard-stale lag=\(formatSeconds(lagSeconds))s behind=\(segmentsBehind)"
         }
 
-        return segmentsBehind > maximumAllowedSegmentsBehind
-            && lagSeconds >= softStaleLagSeconds
+        if segmentsBehind > maximumAllowedSegmentsBehind
+            && lagSeconds >= softStaleLagSeconds {
+            return "soft-stale lag=\(formatSeconds(lagSeconds))s behind=\(segmentsBehind)"
+        }
+
+        return nil
     }
 
     private func noteSubtitleDisplayed(id: Int?) {
@@ -170,6 +206,13 @@ final class TranscriptionPipeline {
         submittedAtByTranslationID = submittedAtByTranslationID.filter { id, _ in
             id >= minimumID
         }
+    }
+
+    private func formatSeconds(_ value: TimeInterval?) -> String {
+        guard let value else {
+            return "na"
+        }
+        return String(format: "%.3f", value)
     }
 }
 

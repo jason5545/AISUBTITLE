@@ -122,7 +122,11 @@ struct AppConfig: Decodable {
             translatorCommand: CommandSpec(
                 argv: [workingDirectory.appendingPathComponent("scripts/codex-translate-lines.sh").path],
                 shell: nil,
-                environment: nil
+                environment: [
+                    "AISUBTITLE_VERBOSE_LOG": "1",
+                    "AISUBTITLE_TRANSLATE_DRAIN_SECONDS": "0.05",
+                    "AISUBTITLE_TRANSLATE_MAX_IN_FLIGHT": "3"
+                ]
             )
         )
     }

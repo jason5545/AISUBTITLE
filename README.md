@@ -27,6 +27,36 @@ For the normal macOS GUI launch path:
 open -n /Applications/AISubtitle.app
 ```
 
+## Terminal Media Run
+
+For cmux/terminal use, play a local video as audio-only and stream subtitles in the terminal:
+
+```bash
+./scripts/run-media.sh
+./scripts/run-media.sh "/path/to/video.mp4"
+```
+
+With no media path, AISubtitle scans `~/Downloads` for videos and shows an interactive picker. Use ↑/↓ to select, Enter to start, or `q` to cancel. If the selected media file has chapters, the terminal then shows the same picker for chapters. The selected media/chapter is played with `ffplay -nodisp` and transcribed through the same Qwen3-ASR stdin contract.
+
+During playback, the terminal switches to a now-playing view with progress, current subtitle, and recent subtitle lines. Subtitles are also mirrored to the AISubtitle floating window. If a floating window already exists, the terminal player connects to it and takes over that window; otherwise it starts a lightweight `aisubtitle --overlay-stdin` helper.
+
+Useful options:
+
+```bash
+./scripts/run-media.sh --list-videos
+./scripts/run-media.sh --media-dir "$HOME/Movies"
+./scripts/run-media.sh --list-chapters "/path/to/video.mp4"
+./scripts/run-media.sh --chapter 3 "/path/to/video.mp4"
+./scripts/run-media.sh --chapter "Intro" "/path/to/video.mp4"
+./scripts/run-media.sh --all "/path/to/video.mp4"
+./scripts/run-media.sh --no-play --no-translate "/path/to/video.mp4"
+./scripts/run-media.sh --plain "/path/to/video.mp4"
+./scripts/run-media.sh --no-floating-window "/path/to/video.mp4"
+./scripts/run-media.sh --json "/path/to/video.mp4"
+```
+
+Chinese ASR output is sent through translator direct mode by default, so OpenCC handles it without spending LLM calls. Use `--no-direct-chinese` only when you explicitly want Chinese text to go through the LLM translator.
+
 `scripts/run-real.sh`, `scripts/build-app-bundle.sh`, and `scripts/deploy-app.sh` build both products first:
 
 - `.build/debug/qwen3-asr-stdin`
