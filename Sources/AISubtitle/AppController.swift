@@ -12,12 +12,21 @@ final class AppController: NSObject {
     private var statusItem: NSStatusItem?
     private var isRunning = false
     private var externalOverlayActive = false
+    private var shouldResumeAfterSystemWake = false
+    private var wakeRestartTask: Task<Void, Never>?
+    private let wakeRestartDelayNanoseconds: UInt64 = 1_500_000_000
 
     override init() {
         workingDirectory = Self.resolveWorkingDirectory()
         super.init()
         setupStatusItem()
         setupOverlayIPC()
+        setupPowerNotifications()
+    }
+
+    deinit {
+        wakeRestartTask?.cancel()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     private static func resolveWorkingDirectory() -> URL {
@@ -114,7 +123,7 @@ final class AppController: NSObject {
         }
     }
 
-    private func stopAsync() async {
+    private func stopAsync(finalStatus: String = "Stopped") async {
         guard isRunning else {
             return
         }
@@ -125,7 +134,7 @@ final class AppController: NSObject {
         captureService = nil
         pipeline = nil
         isRunning = false
-        overlay.showStatus("Stopped")
+        overlay.showStatus(finalStatus)
         updateMenu()
     }
 
@@ -141,6 +150,22 @@ final class AppController: NSObject {
             self?.handleOverlayIPC(line)
         }
         overlayIPCServer?.start()
+    }
+
+    private func setupPowerNotifications() {
+        let notificationCenter = NSWorkspace.shared.notificationCenter
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(systemWillSleep),
+            name: NSWorkspace.willSleepNotification,
+            object: nil
+        )
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(systemDidWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
     }
 
     private func handleOverlayIPC(_ line: String) {
@@ -166,6 +191,45 @@ final class AppController: NSObject {
         } else {
             start()
         }
+    }
+
+    @objc private func systemWillSleep() {
+        shouldResumeAfterSystemWake = isRunning || captureService != nil || pipeline != nil
+        guard shouldResumeAfterSystemWake else {
+            return
+        }
+
+        wakeRestartTask?.cancel()
+        overlay.showStatus("System sleep: pausing capture")
+        Task {
+            await stopAsync(finalStatus: "Paused for system sleep")
+        }
+    }
+
+    @objc private func systemDidWake() {
+        let shouldRestart = shouldResumeAfterSystemWake || isRunning || captureService != nil || pipeline != nil
+        shouldResumeAfterSystemWake = false
+        guard shouldRestart else {
+            return
+        }
+
+        wakeRestartTask?.cancel()
+        wakeRestartTask = Task { [weak self] in
+            await self?.restartAfterSystemWake()
+        }
+    }
+
+    private func restartAfterSystemWake() async {
+        overlay.showStatus("System wake: recapturing Helium")
+        await stopAsync(finalStatus: "Reconnecting after wake")
+
+        do {
+            try await Task.sleep(nanoseconds: wakeRestartDelayNanoseconds)
+        } catch {
+            return
+        }
+
+        await startAsync()
     }
 
     @objc private func quit() {

@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import select
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import concurrent.futures
 import http.client
@@ -66,6 +68,9 @@ CLINE_WEEKLY_LIMIT_HOURS = float(os.environ.get("CLINE_USAGE_WEEKLY_LIMIT_HOURS"
 CLINE_MONTHLY_LIMIT_HOURS = float(os.environ.get("CLINE_USAGE_MONTHLY_LIMIT_HOURS", str(CLINE_WEEKLY_LIMIT_HOURS * 4)))
 SESSION_HISTORY_LIMIT = int(os.environ.get("AISUBTITLE_TRANSLATE_SESSION_HISTORY_LIMIT", "6"))
 LOOKAHEAD_LINES = min(1, max(0, int(os.environ.get("AISUBTITLE_TRANSLATE_LOOKAHEAD_LINES", "1"))))
+LOOKAHEAD_MODE = os.environ.get("AISUBTITLE_TRANSLATE_LOOKAHEAD_MODE", "auto").strip().lower()
+if LOOKAHEAD_MODE not in {"auto", "always"}:
+    LOOKAHEAD_MODE = "auto"
 LOOKAHEAD_MAX_DELAY_SECONDS = max(
     0.0,
     float(os.environ.get("AISUBTITLE_TRANSLATE_LOOKAHEAD_MAX_DELAY_SECONDS", "1.2")),
@@ -83,6 +88,13 @@ ORDERED_EMISSION = (
 OPENCC_CONFIG = os.environ.get("AISUBTITLE_OPENCC_CONFIG", "s2twp.json").strip() or "s2twp.json"
 OPENCC_BIN = os.environ.get("AISUBTITLE_OPENCC_BIN", "").strip()
 VERBOSE_LOG = os.environ.get("AISUBTITLE_VERBOSE_LOG", "").strip().lower() in {"1", "true", "yes", "on"}
+FAKE_TRANSLATE = os.environ.get("AISUBTITLE_TRANSLATE_FAKE_API", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+FAKE_TRANSLATE_DELAY_SECONDS = max(0.0, float(os.environ.get("AISUBTITLE_TRANSLATE_FAKE_DELAY_SECONDS", "0")))
 
 API_PARTS = urllib.parse.urlsplit(API_URL)
 API_SCHEME = API_PARTS.scheme.lower()
@@ -119,6 +131,34 @@ _CONNECTION_ERRORS = (
 )
 
 READ_TIMEOUT = object()
+
+SENTENCE_FINAL_CHARS = ".!?…。！？」』"
+TRAILING_CLOSERS = "\"'”’)]}）】》」』"
+CONNECTIVE_TAIL_WORDS = {
+    "and",
+    "or",
+    "but",
+    "so",
+    "because",
+    "although",
+    "if",
+    "when",
+    "while",
+    "that",
+    "which",
+    "who",
+    "to",
+    "of",
+    "in",
+    "on",
+    "at",
+    "for",
+    "with",
+    "from",
+    "by",
+    "as",
+    "than",
+}
 
 SUPPLEMENTARY_OPENCC_MAPPINGS = (
     ("優盤", "隨身碟"),
@@ -191,6 +231,9 @@ class LineReader:
         return None
 
     def drain_to_latest(self, line: str, seconds: float) -> tuple[str, int]:
+        if seconds <= 0:
+            return line, 0
+
         dropped = 0
         deadline = time.monotonic() + max(0.0, seconds)
 
@@ -240,6 +283,94 @@ def preview(text: str, limit: int = 80) -> str:
 
 def seconds_label(value: float | None) -> str:
     return f"{value:.3f}s" if value is not None else "na"
+
+
+def strip_trailing_closers(text: str) -> str:
+    return text.strip().rstrip(TRAILING_CLOSERS).strip()
+
+
+def has_sentence_final_punctuation(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    if stripped[-1] in SENTENCE_FINAL_CHARS:
+        return True
+
+    core = strip_trailing_closers(stripped)
+    return bool(core and core[-1] in SENTENCE_FINAL_CHARS)
+
+
+def ends_with_complete_percentage(text: str) -> bool:
+    core = strip_trailing_closers(text)
+    return bool(re.search(r"\d+(?:\.\d+)?%\s*$", core))
+
+
+def dangling_numeric_fragment_reason(text: str) -> str | None:
+    core = strip_trailing_closers(text)
+    if not core:
+        return None
+
+    if ends_with_complete_percentage(core):
+        return None
+
+    if re.search(r"\d+\.\s*$", core):
+        return "dangling-number"
+    if re.search(r"[$€£¥]\s*$", core):
+        return "dangling-currency"
+    if re.search(r"[$€£¥]\s*\d+\s*$", core):
+        return "dangling-currency"
+    if re.search(r"\d{1,3}(?:,\d{0,3})+\s*$", core):
+        return "dangling-number"
+    if re.search(r"\d\s*$", core):
+        return "dangling-number"
+    if re.search(r"(?<!\d)%\s*$", core):
+        return "dangling-percent"
+
+    return None
+
+
+def connective_tail_reason(text: str) -> str | None:
+    core = strip_trailing_closers(text)
+    match = re.search(r"([A-Za-z]+)\s*$", core)
+    if match and match.group(1).lower() in CONNECTIVE_TAIL_WORDS:
+        return "connective-tail"
+    return None
+
+
+def word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w']+\b", text))
+
+
+def lookahead_incomplete_reason(text: str, language: str | None) -> str | None:
+    del language
+
+    stripped = text.strip()
+    if not stripped:
+        return "empty"
+
+    numeric_reason = dangling_numeric_fragment_reason(stripped)
+    if numeric_reason is not None:
+        return numeric_reason
+
+    connective_reason = connective_tail_reason(stripped)
+    if connective_reason is not None:
+        return connective_reason
+
+    if has_sentence_final_punctuation(stripped):
+        return None
+
+    if ends_with_complete_percentage(stripped):
+        return None
+
+    if word_count(stripped) < 3:
+        return "very-short"
+
+    return "no-final-punct"
+
+
+def looks_incomplete(text: str, language: str | None) -> bool:
+    return lookahead_incomplete_reason(text, language) is not None
 
 
 def load_secret_file() -> None:
@@ -619,6 +750,7 @@ def format_source_context_item(item: object) -> str | None:
 
 def context_lines(context: dict[str, object]) -> list[str]:
     lines: list[str] = []
+    previous_source_texts: set[str] = set()
 
     previous = context.get("previous_subtitles")
     target = context.get("target_subtitle")
@@ -635,6 +767,10 @@ def context_lines(context: dict[str, object]) -> list[str]:
             for item in previous_items:
                 formatted = format_source_context_item(item)
                 if formatted:
+                    if isinstance(item, dict):
+                        previous_text = str(item.get("text", "")).strip()
+                        if previous_text:
+                            previous_source_texts.add(previous_text)
                     lines.append(f"- Previous: {formatted}")
 
         formatted_target = format_source_context_item(target)
@@ -657,15 +793,20 @@ def context_lines(context: dict[str, object]) -> list[str]:
 
     history = context.get("session_history")
     if isinstance(history, list) and history:
-        lines.append("Recent same-URL subtitle context:")
+        history_lines: list[str] = []
         for item in history[-SESSION_HISTORY_LIMIT:]:
             if not isinstance(item, dict):
                 continue
             source_text = str(item.get("source", "")).strip()
             translation = str(item.get("translation", "")).strip()
+            if source_text in previous_source_texts:
+                continue
             if source_text and translation:
-                lines.append(f"- Source: {source_text}")
-                lines.append(f"  zh-TW: {translation}")
+                history_lines.append(f"- Source: {source_text}")
+                history_lines.append(f"  zh-TW: {translation}")
+        if history_lines:
+            lines.append("Recent same-URL subtitle context:")
+            lines.extend(history_lines)
 
     return lines
 
@@ -811,6 +952,22 @@ def extract_translation(response: dict[str, object]) -> str:
 
 
 def translate(text: str, api_key: str, context: dict[str, object]) -> tuple[str, dict[str, object] | None] | None:
+    if FAKE_TRANSLATE:
+        if FAKE_TRANSLATE_DELAY_SECONDS > 0:
+            time.sleep(FAKE_TRANSLATE_DELAY_SECONDS)
+        parts = [f"FAKE:{text}"]
+        next_subtitle = context.get("next_subtitle")
+        if isinstance(next_subtitle, dict):
+            next_text = str(next_subtitle.get("text", "")).strip()
+            if next_text:
+                parts.append(f"next={next_text}")
+        return " | ".join(parts), {
+            "provider": "fake",
+            "model": "fake",
+            "elapsed_seconds": FAKE_TRANSLATE_DELAY_SECONDS,
+            "display": "Fake",
+        }
+
     body = json.dumps(request_payload(text, context), ensure_ascii=False).encode("utf-8")
     source_id = context.get("id")
 
@@ -912,6 +1069,213 @@ def result_payload(result: TranslationResult) -> dict[str, object]:
     return payload
 
 
+def self_test_assert(condition: bool, message: str) -> None:
+    if not condition:
+        raise AssertionError(message)
+
+
+def jsonl_line(payload: dict[str, object]) -> str:
+    return json.dumps(payload, ensure_ascii=False) + "\n"
+
+
+def parse_jsonl(output: str) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line:
+            events.append(json.loads(line))
+    return events
+
+
+def self_test_env(tmpdir: str, **overrides: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("AISUBTITLE_TRANSLATE_SELF_TEST", None)
+    env.update(
+        {
+            "AISUBTITLE_TRANSLATE_FAKE_API": "1",
+            "AISUBTITLE_TRANSLATE_FAKE_DELAY_SECONDS": "0",
+            "AISUBTITLE_TRANSLATE_WORKDIR": tmpdir,
+            "OPENROUTER_TRANSLATE_LOG": os.path.join(tmpdir, "translate.log"),
+            "OPENROUTER_API_KEY": "fake",
+            "AISUBTITLE_VERBOSE_LOG": "1",
+            "AISUBTITLE_TRANSLATE_DRAIN_SECONDS": "0",
+            "AISUBTITLE_TRANSLATE_LOOKAHEAD_LINES": "1",
+            "AISUBTITLE_TRANSLATE_LOOKAHEAD_MODE": "auto",
+            "AISUBTITLE_TRANSLATE_LOOKAHEAD_MAX_DELAY_SECONDS": "0.05",
+            "AISUBTITLE_TRANSLATE_ORDERED_EMISSION": "1",
+            "AISUBTITLE_TRANSLATE_MAX_IN_FLIGHT": "3",
+        }
+    )
+    env.update(overrides)
+    return env
+
+
+def run_pipeline_case(
+    lines: list[dict[str, object]],
+    *,
+    env_overrides: dict[str, str] | None = None,
+    write_pause: float = 0.03,
+) -> tuple[list[dict[str, object]], str]:
+    with tempfile.TemporaryDirectory(prefix="aisubtitle-translate-test-") as tmpdir:
+        env = self_test_env(tmpdir, **(env_overrides or {}))
+        process = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        assert process.stdin is not None
+        assert process.stdout is not None
+        assert process.stderr is not None
+
+        for payload in lines:
+            process.stdin.write(jsonl_line(payload))
+            process.stdin.flush()
+            time.sleep(write_pause)
+        process.stdin.close()
+        process.stdin = None
+
+        stdout = process.stdout.read()
+        stderr = process.stderr.read()
+        return_code = process.wait(timeout=5)
+        self_test_assert(return_code == 0, f"pipeline exited {return_code}: {stderr}")
+
+        log_path = env["OPENROUTER_TRANSLATE_LOG"]
+        try:
+            with open(log_path, encoding="utf-8") as handle:
+                log_text = handle.read()
+        except FileNotFoundError:
+            log_text = ""
+
+        return parse_jsonl(stdout), log_text
+
+
+def run_timeout_pipeline_case() -> tuple[dict[str, object], str]:
+    with tempfile.TemporaryDirectory(prefix="aisubtitle-translate-timeout-test-") as tmpdir:
+        env = self_test_env(tmpdir)
+        process = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        assert process.stdin is not None
+        assert process.stdout is not None
+        assert process.stderr is not None
+
+        process.stdin.write(jsonl_line({"id": 1, "text": "I think", "language": "English"}))
+        process.stdin.flush()
+
+        ready, _, _ = select.select([process.stdout], [], [], 1.0)
+        self_test_assert(bool(ready), "lookahead timeout did not emit a held line")
+        first_line = process.stdout.readline()
+
+        process.stdin.close()
+        process.stdin = None
+        process.wait(timeout=5)
+
+        log_path = env["OPENROUTER_TRANSLATE_LOG"]
+        try:
+            with open(log_path, encoding="utf-8") as handle:
+                log_text = handle.read()
+        except FileNotFoundError:
+            log_text = ""
+
+        return json.loads(first_line), log_text
+
+
+def run_self_test() -> int:
+    self_test_assert(not looks_incomplete("This is complete.", "English"), "complete sentence held")
+    self_test_assert(looks_incomplete("This is not complete", "English"), "missing final punctuation skipped")
+    self_test_assert(looks_incomplete("I think", "English"), "very short fragment skipped")
+    self_test_assert(looks_incomplete("I will go with", "English"), "connective tail skipped")
+    self_test_assert(looks_incomplete("$3", "English"), "currency fragment skipped")
+    self_test_assert(looks_incomplete("45.", "English"), "dangling decimal skipped")
+    self_test_assert(not looks_incomplete("45%", "English"), "complete percentage held")
+    self_test_assert(not looks_incomplete("「完成了。」", "Chinese"), "CJK final punctuation held")
+
+    dedup_context = {
+        "previous_subtitles": [{"id": 1, "text": "Overlap", "language": "English"}],
+        "target_subtitle": {"id": 2, "text": "Target"},
+        "session_history": [
+            {"source": "Overlap", "translation": "重複"},
+            {"source": "Other", "translation": "其他"},
+        ],
+    }
+    dedup_lines = context_lines(dedup_context)
+    self_test_assert("- Source: Overlap" not in dedup_lines, "overlapping history source was not deduped")
+    self_test_assert("- Source: Other" in dedup_lines, "non-overlapping history source was removed")
+
+    empty_history_context = {
+        "previous_subtitles": [{"id": 1, "text": "Overlap", "language": "English"}],
+        "target_subtitle": {"id": 2, "text": "Target"},
+        "session_history": [{"source": "Overlap", "translation": "重複"}],
+    }
+    self_test_assert(
+        "Recent same-URL subtitle context:" not in context_lines(empty_history_context),
+        "empty deduped history still emitted its header",
+    )
+
+    complete_events, complete_log = run_pipeline_case(
+        [
+            {"id": 1, "text": "This is complete.", "language": "English"},
+            {"id": 2, "text": "This is next.", "language": "English"},
+        ]
+    )
+    self_test_assert(complete_events[0]["id"] == 1, "complete line did not emit first")
+    self_test_assert(complete_events[0]["text"] == "FAKE:This is complete.", "complete line got next context")
+    self_test_assert("lookahead-skip id=1 complete" in complete_log, "complete skip was not logged")
+
+    held_events, held_log = run_pipeline_case(
+        [
+            {"id": 1, "text": "I think", "language": "English"},
+            {"id": 2, "text": "this is done.", "language": "English"},
+        ]
+    )
+    self_test_assert(held_events[0]["id"] == 1, "held line did not emit first")
+    self_test_assert(
+        held_events[0]["text"] == "FAKE:I think | next=this is done.",
+        "held line did not use next subtitle context",
+    )
+    self_test_assert("lookahead-hold id=1" in held_log, "hold decision was not logged")
+
+    timeout_event, timeout_log = run_timeout_pipeline_case()
+    self_test_assert(timeout_event["id"] == 1, "timeout emitted the wrong id")
+    self_test_assert(timeout_event["text"] == "FAKE:I think", "timeout line unexpectedly had next context")
+    self_test_assert("lookahead-timeout id=1" in timeout_log, "timeout flush was not logged")
+
+    always_events, always_log = run_pipeline_case(
+        [
+            {"id": 1, "text": "This is complete.", "language": "English"},
+            {"id": 2, "text": "This is next.", "language": "English"},
+        ],
+        env_overrides={"AISUBTITLE_TRANSLATE_LOOKAHEAD_MODE": "always"},
+    )
+    self_test_assert(
+        always_events[0]["text"] == "FAKE:This is complete. | next=This is next.",
+        "always mode did not hold a complete line",
+    )
+    self_test_assert("lookahead-hold id=1 reason=mode-always" in always_log, "always hold was not logged")
+
+    direct_events, direct_log = run_pipeline_case(
+        [
+            {"id": 1, "text": "This is complete.", "language": "English"},
+            {"id": 2, "text": "測試", "language": "Chinese", "direct": True},
+        ],
+        env_overrides={"AISUBTITLE_TRANSLATE_FAKE_DELAY_SECONDS": "0.2"},
+    )
+    self_test_assert([event.get("id") for event in direct_events] == [2], "direct did not overtake stale API output")
+    self_test_assert("direct-overtake id=2 pending=[1]" in direct_log, "direct overtake was not logged")
+    self_test_assert("skipped out-of-order id=1" in direct_log, "late API result was not dropped")
+
+    print("self-test ok")
+    return 0
+
+
 def main() -> int:
     global missing_api_key_logged
 
@@ -940,9 +1304,22 @@ def main() -> int:
     def next_expected_id() -> int | None:
         return min(expected_emit_ids) if expected_emit_ids else None
 
+    def purge_stale_ordered_state_locked() -> None:
+        nonlocal next_expected_emit_id
+
+        if last_emitted_id is None:
+            return
+
+        stale_ids = [source_id for source_id in expected_emit_ids if source_id <= last_emitted_id]
+        for source_id in stale_ids:
+            expected_emit_ids.discard(source_id)
+            pending_emit_results.pop(source_id, None)
+        next_expected_emit_id = next_expected_id()
+
     def flush_ordered_results_locked() -> None:
         nonlocal next_expected_emit_id
 
+        purge_stale_ordered_state_locked()
         while next_expected_emit_id is not None:
             source_id = next_expected_emit_id
             result = pending_emit_results.pop(source_id, None)
@@ -1006,6 +1383,29 @@ def main() -> int:
                     log(f"{PROVIDER} skipped out-of-order id={source_id} last_emitted_id={last_emitted_id}")
                     return
             emit_now(result)
+
+            purge_stale_ordered_state_locked()
+
+    def emit_direct_result(result: TranslationResult) -> bool:
+        source_id = result.source_id
+        with emit_lock:
+            if isinstance(source_id, int):
+                if last_emitted_id is not None and source_id <= last_emitted_id:
+                    log(f"direct skipped out-of-order id={source_id} last_emitted_id={last_emitted_id}")
+                    return False
+
+                overtaken_ids = sorted(
+                    source
+                    for source in set(expected_emit_ids) | set(pending_emit_results)
+                    if source <= source_id
+                )
+                if overtaken_ids:
+                    log(f"direct-overtake id={source_id} pending={overtaken_ids}")
+
+            emit_now(result)
+            purge_stale_ordered_state_locked()
+            flush_ordered_results_locked()
+            return True
 
     def finish_future(source_id: int | None, future: concurrent.futures.Future[TranslationResult | None]) -> None:
         try:
@@ -1075,6 +1475,8 @@ def main() -> int:
         global missing_api_key_logged
 
         api_key = os.environ.get(key_name, "").strip()
+        if FAKE_TRANSLATE and not api_key:
+            api_key = "fake"
         if not api_key:
             if not missing_api_key_logged:
                 log(f"{PROVIDER} translation failed: {key_name} missing. secret={SECRET_FILE}")
@@ -1160,12 +1562,11 @@ def main() -> int:
                     submit_translation_job(executor, pending_translation, next_job=job)
                     pending_translation = None
 
-                register_expected_emit_id(source_id)
                 direct_started = time.perf_counter()
                 verbose(f"direct-start id={source_id}")
                 translated, metadata = direct_process(text)
                 verbose(f"direct-done id={source_id} elapsed={time.perf_counter() - direct_started:.3f}s")
-                emit_result(
+                emitted_direct = emit_direct_result(
                     TranslationResult(
                         source_id=source_id,
                         source_text=text,
@@ -1175,19 +1576,31 @@ def main() -> int:
                         context_url=parsed.get("context_url"),
                     )
                 )
-                record_source_context(job)
+                if emitted_direct:
+                    record_source_context(job)
                 continue
 
             if LOOKAHEAD_LINES > 0:
                 if pending_translation is not None:
                     submit_translation_job(executor, pending_translation, next_job=job)
-                pending_translation = job
-                verbose(
-                    f"lookahead-pending id={source_id} "
-                    f"delay={LOOKAHEAD_MAX_DELAY_SECONDS:.3f}s "
-                    f"text={preview(text)!r}"
-                )
-                continue
+                    pending_translation = None
+
+                language = parsed.get("language")
+                language = language if isinstance(language, str) else None
+                incomplete_reason = lookahead_incomplete_reason(text, language)
+                should_hold = LOOKAHEAD_MODE == "always" or incomplete_reason is not None
+                if should_hold:
+                    pending_translation = job
+                    reason = "mode-always" if LOOKAHEAD_MODE == "always" else incomplete_reason
+                    verbose(
+                        f"lookahead-hold id={source_id} "
+                        f"reason={reason} "
+                        f"delay={LOOKAHEAD_MAX_DELAY_SECONDS:.3f}s "
+                        f"text={preview(text)!r}"
+                    )
+                    continue
+
+                verbose(f"lookahead-skip id={source_id} complete text={preview(text)!r}")
 
             submit_translation_job(executor, job)
 
@@ -1199,4 +1612,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv[1:] or os.environ.get("AISUBTITLE_TRANSLATE_SELF_TEST", "").strip() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        raise SystemExit(run_self_test())
     raise SystemExit(main())
