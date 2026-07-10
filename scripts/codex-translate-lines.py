@@ -45,7 +45,7 @@ if PROVIDER == "openrouter":
     MODEL = (
         os.environ.get("AISUBTITLE_TRANSLATE_MODEL")
         or os.environ.get("OPENROUTER_TRANSLATE_MODEL")
-        or "google/gemini-3.1-flash-lite"
+        or "openai/gpt-5.6-luna"
     )
     REASONING = os.environ.get("OPENROUTER_REASONING_EFFORT", "none")
 else:

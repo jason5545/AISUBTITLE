@@ -4,7 +4,7 @@ macOS floating subtitle pipeline:
 
 1. Capture Helium audio with ScreenCaptureKit.
 2. Stream 16 kHz mono signed 16-bit PCM into local native Qwen3-ASR 1.7B.
-3. Send non-Chinese ASR segments to OpenRouter Gemini 3.1 Flash Lite for Traditional Chinese translation.
+3. Send non-Chinese ASR segments to OpenRouter GPT-5.6 Luna for Traditional Chinese translation.
 4. Skip Chinese ASR segments by default; when macOS output volume is muted or zero, send them through direct OpenCC post-processing and bypass the LLM.
 5. Show translated or direct-processed text in an always-on-top floating window.
 
@@ -68,7 +68,7 @@ If `config.json` is absent, the app uses real local defaults:
 
 - Helium bundle id: `net.imput.helium`
 - Qwen model: `/Users/jianruicheng/Library/Application Support/com.jasonchien.Voco/Qwen3Models/mlx-community_Qwen3-ASR-1.7B-8bit`
-- Translator: `scripts/codex-translate-lines.sh`, backed by OpenRouter model `google/gemini-3.1-flash-lite`
+- Translator: `scripts/codex-translate-lines.sh`, backed by OpenRouter model `openai/gpt-5.6-luna`
 
 Store API keys in `.secret`:
 
